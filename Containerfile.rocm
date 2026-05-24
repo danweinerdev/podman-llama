@@ -1,0 +1,155 @@
+# =============================================================================
+# llama.cpp – AMD Strix Halo (gfx1151) – Rootless Podman
+# =============================================================================
+#
+# Targets: Radeon 8060S / gfx1151 (Ryzen AI Max / Minisforum MS-1 Max)
+# Backend: ROCm (HIP) with rocWMMA flash-attention + UMA
+#          Vulkan variant at the bottom (comment/uncomment as needed)
+
+# ---------------------------------------------------------------------------
+# Stage 1 – Build
+# ---------------------------------------------------------------------------
+# Use the ROCm base that ships the HIP toolchain. Fedora 43's ROCm packages
+# are the most up-to-date distro-packaged stack for gfx1151.
+FROM registry.fedoraproject.org/fedora:44 AS builder
+
+ARG LLAMA_TAG=master
+# GPU targets: gfx1151 (Strix Halo iGPU). Add gfx1201 if you also use an
+# RDNA4 eGPU. Add gfx1100 for gfx1100-compat kernels (sometimes 2–6× faster
+# than native gfx1151 kernels on older ROCm builds).
+ARG AMDGPU_TARGETS="gfx1151"
+
+# ---------------------------------------------------------------------------
+# Install ROCm build toolchain + llama.cpp build deps
+# ---------------------------------------------------------------------------
+RUN dnf install -y \
+        rocm-core \
+        rocm-hip \
+        rocm-hip-devel \
+        hipblas-devel \
+        hipblaslt-devel \
+        rocblas-devel \
+        hipsparse-devel \
+        hipsolver-devel \
+        rocsolver-devel \
+        hipcub-devel \
+        rocwmma-devel \
+    && dnf install -y \
+        cmake \
+        ninja-build \
+        clang \
+        git \
+        libcurl-devel \
+        python3 \
+    && dnf clean all
+
+# Force clang as the C/C++ compiler for the entire build.
+# This is required because:
+#   1. The -mllvm LLVM pass flags are clang-only and will fail with GCC.
+#   2. HIP device code must be compiled by clang anyway; using the same
+#      compiler for host code avoids mismatched ABI / LTO issues.
+ENV CC=clang
+ENV CXX=clang++
+
+# ---------------------------------------------------------------------------
+# Clone llama.cpp at requested tag/branch
+# ---------------------------------------------------------------------------
+WORKDIR /build
+RUN git clone --depth=1 \
+        ${LLAMA_TAG:+--branch ${LLAMA_TAG}} \
+        https://github.com/ggerganov/llama.cpp.git \
+    || git clone --depth=1 https://github.com/ggerganov/llama.cpp.git
+
+WORKDIR /build/llama.cpp
+
+# ---------------------------------------------------------------------------
+# Configure – ROCm/HIP backend, tuned for gfx1151
+#
+# Key flags:
+#   DGGML_HIP=ON                – enable ROCm/HIP backend
+#   DAMDGPU_TARGETS             – compile kernels only for our GPU(s)
+#   DGGML_HIP_ROCWMMA_FATTN=OFF – disabled: rocwmma/internal/float8.hpp
+#                                  conflicts with amd_hip_fp16.h on Fedora 43
+#                                  ROCm headers (explicit specialization after
+#                                  implicit instantiation). Standard HIP FA
+#                                  (-fa 1 at runtime) still works fine.
+#   DGGML_HIP_UMA=ON            – unified memory (critical for Strix Halo)
+#
+# Compiler workaround for LLVM loop-unroll regression (llvm-project#147700):
+#   -mllvm --amdgpu-unroll-threshold-local=600
+#   This restores ROCm 7+ performance to parity with ROCm 6.4.4.
+#   Remove once upstream fix lands.
+# ---------------------------------------------------------------------------
+RUN HIPCXX="$(hipconfig -l)/clang" \
+    HIP_PATH="$(hipconfig -R)" \
+    cmake -S . -B build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_HIP=ON \
+        -DAMDGPU_TARGETS="${AMDGPU_TARGETS}" \
+        -DGGML_HIP_ROCWMMA_FATTN=OFF \
+        -DGGML_HIP_UMA=ON \
+        -DLLAMA_CURL=ON \
+        -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600"
+
+RUN cmake --build build --config Release -j$(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 2 – Runtime image (minimal)
+# ---------------------------------------------------------------------------
+FROM registry.fedoraproject.org/fedora:44 AS runtime
+
+# Install only the ROCm runtime libraries (not the full devel stack)
+RUN dnf install -y --setopt=install_weak_deps=False \
+        rocm-core \
+        rocm-hip \
+        rocm-smi \
+        hipblas \
+        hipblaslt \
+        rocblas \
+    && dnf install -y --setopt=install_weak_deps=False \
+        libcurl \
+        python3 \
+        libomp \
+    && dnf clean all
+
+# Copy built binaries from the builder stage
+COPY --from=builder /build/llama.cpp/build/bin/ /usr/local/bin/
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+
+# Force rocBLAS → hipBLASLt path (best throughput on gfx1151).
+# Set to 0 to let rocBLAS auto-select (useful for comparison/debugging).
+ENV ROCBLAS_USE_HIPBLASLT=1
+
+# HIP visible devices – expose all by default; override at runtime if needed
+# e.g.: podman run -e HIP_VISIBLE_DEVICES=0 ...
+ENV HIP_VISIBLE_DEVICES=0
+
+# Suppress the "no such file or directory" spam for missing GPU nodes
+ENV AMD_LOG_LEVEL=0
+
+# ---------------------------------------------------------------------------
+# Rootless Podman: run as non-root user inside the container.
+# The render/video group access is handled by --group-add on the host side;
+# we don't need (or want) to run as root inside the container.
+# ---------------------------------------------------------------------------
+RUN useradd -m -u 1000 llama
+USER llama
+WORKDIR /home/llama
+
+# Models volume mount point
+VOLUME ["/models"]
+
+# llama-server default port
+EXPOSE 8080
+
+# Default entrypoint: llama-server
+# Override argv at runtime for llama-cli, llama-bench, etc.
+ENTRYPOINT ["/usr/local/bin/llama-server"]
+CMD ["--help"]

@@ -1,0 +1,184 @@
+# =============================================================================
+# llama.cpp – AMD Strix Halo (gfx1151) – Rootless Podman – VULKAN backend
+# =============================================================================
+#
+# Targets: Radeon 8060S / gfx1151 (Ryzen AI Max / Minisforum MS-1 Max)
+# Backend: Vulkan via Mesa RADV (open-source AMD driver)
+#
+# Why Vulkan instead of ROCm:
+#   ROCm on gfx1151 is broken on kernel 7.0.x due to a KFD ABI regression
+#   (see ROCm/ROCm#6182 — HSA "Memory in use" crash on first model load,
+#   not fixable in userspace). Vulkan via RADV is known-good on the same
+#   hardware and kernel. Performance is ~80-90% of ROCm on this hardware.
+#
+# Notes:
+#   - Only /dev/dri is needed (no /dev/kfd — that's a ROCm/HSA device).
+#   - --ubatch-size 1024 is optimal for Vulkan on gfx1151 (vs 2048 for ROCm).
+#   - --no-mmap still recommended on Strix Halo for predictable allocation.
+#   - --ulimit memlock=-1:-1 still required to allow large GTT allocations.
+#   - iommu=pt amdgpu.gttsize=N ttm.pages_limit=N still needed on the host —
+#     Vulkan also uses GTT for buffer storage.
+#
+# HOST SETUP (required on host, not in container):
+#   Add to GRUB_CMDLINE_LINUX in /etc/default/grub:
+#     iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856
+#   Then: sudo grub2-mkconfig -o /boot/grub2/grub.cfg && sudo reboot
+#
+#   Ensure your user is in the render and video groups:
+#     sudo usermod -aG render,video $USER
+#
+#   Mesa version on host doesn't matter for Vulkan-in-container — the
+#   container ships its own RADV. But kernel amdgpu driver does need to
+#   be reasonably current (>= 6.18.4 is fine, 7.0.x works for Vulkan).
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1 – Build
+# ---------------------------------------------------------------------------
+FROM registry.fedoraproject.org/fedora:44 AS builder
+
+ARG LLAMA_TAG=master
+
+# ---------------------------------------------------------------------------
+# Install Vulkan SDK, Mesa RADV, and llama.cpp build deps
+# ---------------------------------------------------------------------------
+# vulkan-headers + vulkan-loader-devel: Vulkan API headers and loader for linking
+# glslang / glslc:                       GLSL → SPIR-V shader compilers (llama.cpp
+#                                        ships GLSL compute shaders that get
+#                                        compiled at build time)
+# mesa-vulkan-drivers:                   RADV driver (needed at runtime; pulled
+#                                        in at build to validate SPIR-V output)
+# spirv-tools:                           SPIR-V validation/optimization
+RUN dnf install -y \
+        vulkan-headers \
+        vulkan-loader-devel \
+        vulkan-tools \
+        glslang \
+        glslc \
+        spirv-tools \
+	spirv-tools-devel \
+        spirv-headers-devel \
+        mesa-vulkan-drivers \
+    && dnf install -y \
+        cmake \
+        ninja-build \
+        gcc \
+        gcc-c++ \
+        git \
+        libcurl-devel \
+        python3 \
+    && dnf clean all
+
+# Vulkan build doesn't require clang specifically; GCC works fine and is
+# the Fedora default. Stick with it for simpler toolchain.
+ENV CC=gcc
+ENV CXX=g++
+
+# ---------------------------------------------------------------------------
+# Clone llama.cpp at requested tag/branch
+# ---------------------------------------------------------------------------
+WORKDIR /build
+RUN git clone --depth=1 \
+        ${LLAMA_TAG:+--branch ${LLAMA_TAG}} \
+        https://github.com/ggerganov/llama.cpp.git \
+    || git clone --depth=1 https://github.com/ggerganov/llama.cpp.git
+
+WORKDIR /build/llama.cpp
+
+# ---------------------------------------------------------------------------
+# Configure – Vulkan backend
+#
+# Key flags:
+#   DGGML_VULKAN=ON              – enable Vulkan backend
+#   DGGML_VULKAN_CHECK_RESULTS   – OFF in release (debug-only validation)
+#   DGGML_VULKAN_DEBUG           – OFF in release
+#   DGGML_VULKAN_VALIDATE        – OFF in release (validation layers)
+#   DGGML_VULKAN_RUN_TESTS       – OFF (skip build-time GPU tests; we don't
+#                                        have a GPU at container-build time)
+#   DGGML_VULKAN_SHADER_DEBUG_INFO – OFF in release
+#   DLLAMA_CURL=ON               – curl support for HF model downloads
+#
+# No AMDGPU_TARGETS — Vulkan generates portable SPIR-V at build time and
+# the driver JIT-compiles to GPU ISA at runtime. Same binary runs on any
+# Vulkan 1.2+ GPU.
+# ---------------------------------------------------------------------------
+RUN cmake -S . -B build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=gcc \
+        -DCMAKE_CXX_COMPILER=g++ \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DGGML_VULKAN=ON \
+        -DGGML_VULKAN_CHECK_RESULTS=OFF \
+        -DGGML_VULKAN_DEBUG=OFF \
+        -DGGML_VULKAN_VALIDATE=OFF \
+        -DGGML_VULKAN_RUN_TESTS=OFF \
+        -DGGML_VULKAN_SHADER_DEBUG_INFO=OFF \
+        -DLLAMA_CURL=ON
+
+RUN cmake --build build --config Release -j$(nproc)
+
+# ---------------------------------------------------------------------------
+# Stage 2 – Runtime image (minimal)
+# ---------------------------------------------------------------------------
+FROM registry.fedoraproject.org/fedora:44 AS runtime
+
+# Install only the Vulkan runtime libraries (not the full devel stack).
+# mesa-vulkan-drivers ships the RADV ICD which translates Vulkan calls
+# to AMD GPU commands via the amdgpu kernel driver.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        vulkan-loader \
+        mesa-vulkan-drivers \
+        vulkan-tools \
+    && dnf install -y --setopt=install_weak_deps=False \
+        libcurl \
+        python3 \
+        libgomp \
+    && dnf clean all
+
+# Copy built binaries from the builder stage
+COPY --from=builder /build/llama.cpp/build/bin/ /usr/local/bin/
+
+# ---------------------------------------------------------------------------
+# Runtime environment
+# ---------------------------------------------------------------------------
+# Force RADV as the Vulkan driver (vs amdvlk, which is AMD's proprietary
+# Vulkan driver — slower than RADV on consumer GPUs and not packaged in
+# Fedora). On a system with only RADV installed this is a no-op, but it's
+# defensive in case the runtime image ever ends up with multiple ICDs.
+ENV AMD_VULKAN_ICD=RADV
+
+# Tell the Vulkan loader explicitly where to find the RADV ICD manifest.
+# This avoids any ambiguity if /etc/vulkan/icd.d gets multiple entries.
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+
+# Suppress Mesa shader cache writes to a random tmp dir — pin to /tmp/mesa
+# so it's predictable and easy to clean up.
+ENV MESA_SHADER_CACHE_DIR=/tmp/mesa-shader-cache
+
+# Optional: enable Mesa shader cache (default on, but explicit here)
+ENV MESA_SHADER_CACHE_DISABLE=false
+
+# ---------------------------------------------------------------------------
+# Rootless Podman: run as non-root user inside the container.
+# Only /dev/dri access is needed for Vulkan (no /dev/kfd).
+# The render group access is handled by --group-add keep-groups on the
+# host side.
+# ---------------------------------------------------------------------------
+RUN useradd -m -u 1000 llama \
+    && mkdir -p /tmp/mesa-shader-cache \
+    && chown llama:llama /tmp/mesa-shader-cache
+
+USER llama
+WORKDIR /home/llama
+
+# Models volume mount point
+VOLUME ["/models"]
+
+# llama-server default port
+EXPOSE 8080
+
+# Default entrypoint: llama-server
+# Override argv at runtime for llama-cli, llama-bench, etc.
+ENTRYPOINT ["/usr/local/bin/llama-server"]
+CMD ["--help"]
