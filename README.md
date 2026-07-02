@@ -98,9 +98,24 @@ iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856
 
 then `sudo grub2-mkconfig -o /boot/grub2/grub.cfg && sudo reboot`.
 
+### memlock ceiling (rootless podman)
+
+Rootless containers inherit the systemd **user** session's `LimitMEMLOCK` (8 MiB by default), and `--ulimit memlock=-1:-1` cannot raise it above that. With `--no-mmap` (which locks the whole model in host RAM) this fails on multi-GB models. Two options:
+
+- **Leave mmap on** (default for the `r9700` profile, `NO_MMAP=0`) — the GGUF is mmap-ed from the read-only mount, so the memlock ceiling doesn't matter.
+- **Raise the ceiling** (needed if you want `--no-mmap`, and the default for `strixhalo`):
+
+  ```sh
+  sudo mkdir -p /etc/systemd/system/user@.service.d
+  printf '[Service]\nLimitMEMLOCK=infinity\n' | sudo tee /etc/systemd/system/user@.service.d/memlock.conf
+  sudo systemctl daemon-reload
+  # log out and back in (restarts user@$UID.service), then check: ulimit -l  →  unlimited
+  ```
+
 ## Notes
 
 - ROCm image sets `HSA_OVERRIDE_GFX_VERSION=11.5.1` and enables UMA — required for `gfx1151`.
 - Vulkan image only needs `/dev/dri` (no `/dev/kfd`).
-- `--ulimit memlock=-1:-1` and `--no-mmap` are recommended on Strix Halo for predictable allocation.
+- `--no-mmap` is opt-in per profile (`NO_MMAP`): on for `strixhalo` (predictable unified-memory allocation), off for `r9700` (mmap avoids the rootless memlock ceiling on dedicated VRAM). See the memlock note above.
+- On kernel **7.0.x** the ROCm/KFD path can throw `Memory critical error … Reason: Memory in use` on model load ([ROCm#6182](https://github.com/ROCm/ROCm/issues/6182)). Use the Vulkan runtime (no `/dev/kfd`) until you move to a fixed kernel.
 - Containers run as a non-root user (`llama`, uid 1000) with `--cap-drop=ALL` and `--security-opt no-new-privileges`.

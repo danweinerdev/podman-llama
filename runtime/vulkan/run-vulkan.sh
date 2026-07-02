@@ -85,6 +85,11 @@ PARALLEL="${PARALLEL:-1}"
 env_args=()
 [[ -n "${GPU_INDEX:-}" ]] && env_args+=(-e "GGML_VK_VISIBLE_DEVICES=${GPU_INDEX}")
 
+# --no-mmap is opt-in per profile (NO_MMAP=1). Defaults on for Strix Halo (unified mem),
+# off for dedicated-VRAM cards where the rootless memlock ceiling would bite.
+mmap_args=()
+[[ "${NO_MMAP:-0}" == "1" ]] && mmap_args+=(--no-mmap)
+
 podman run --rm -it \
     --device /dev/dri \
     --group-add keep-groups \
@@ -106,7 +111,7 @@ podman run --rm -it \
     --ubatch-size "${UBATCH}" \
     --batch-size "${BATCH}" \
     --threads "${THREADS}" \
-    --no-mmap \
+    "${mmap_args[@]}" \
     --jinja \
     --host 0.0.0.0 \
     --port 8080 \

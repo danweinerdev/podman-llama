@@ -90,6 +90,11 @@ env_args=()
 [[ -n "${ROCR_VISIBLE_DEVICES:-}" ]] && env_args+=(-e "ROCR_VISIBLE_DEVICES=${ROCR_VISIBLE_DEVICES}")
 [[ -n "${HIP_VISIBLE_DEVICES:-}" ]]  && env_args+=(-e "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES}")
 
+# --no-mmap is opt-in per profile (NO_MMAP=1). On dedicated VRAM with a low rootless
+# memlock ceiling, mmap (the default) avoids locking the whole model in host RAM.
+mmap_args=()
+[[ "${NO_MMAP:-0}" == "1" ]] && mmap_args+=(--no-mmap)
+
 podman run --rm -it \
     --device /dev/kfd \
     --device /dev/dri \
@@ -111,7 +116,7 @@ podman run --rm -it \
     --ubatch-size "${UBATCH}" \
     --batch-size "${BATCH}" \
     --threads "${THREADS}" \
-    --no-mmap \
+    "${mmap_args[@]}" \
     --jinja \
     --host 0.0.0.0 \
     --port 8080 \
