@@ -14,8 +14,11 @@ Two backends are provided:
 | [Containerfile.rocm](Containerfile.rocm) | Multi-stage Fedora 44 build of llama.cpp w/ ROCm/HIP + UMA, tuned for `gfx1151` |
 | [Containerfile.vulkan](Containerfile.vulkan) | Multi-stage Fedora 44 build of llama.cpp w/ Vulkan via Mesa RADV |
 | [Makefile](Makefile) | `make build-rocm` / `make build-vulkan` / `make all` |
-| [run-rocm.sh](run-rocm.sh) | Launch `llama-server` (ROCm) on port 8080 |
-| [run-vulkan.sh](run-vulkan.sh) | Launch `llama-server` (Vulkan) on port 8080 |
+| [runtime/rocm/run-rocm.sh](runtime/rocm/run-rocm.sh) | Generic `llama-server` launcher (ROCm) — no per-model logic |
+| [runtime/vulkan/run-vulkan.sh](runtime/vulkan/run-vulkan.sh) | Generic `llama-server` launcher (Vulkan) — no per-model logic |
+| [profiles/](profiles/) | Per-card / per-machine env config (`r9700.env`, `strixhalo.env`) |
+| [models/](models/) | Per-model env config (path, sampling, KV cache, `n-cpu-moe`) |
+| [commands.txt](commands.txt) | Model download + launch cheatsheet |
 
 ## Build
 
@@ -33,20 +36,51 @@ podman build --build-arg LLAMA_TAG=b4400 -t llama-strix-halo:rocm -f Containerfi
 
 ## Run
 
-Both scripts take the model path (relative to the host models dir, default `/data/models`) as the first argument, mount it read-only at `/models` in the container, and expose `llama-server` on `http://localhost:8080`. Anything after the model path is passed straight through to `llama-server`.
+Two machines are supported via env **profiles** in [profiles/](profiles/):
+
+| `MACHINE` | Hardware | Backend | Key tuning |
+| --- | --- | --- | --- |
+| `r9700` | Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GiB VRAM) | ROCm | native gfx1201, discrete-GPU pinning, ctx 32k |
+| `strixhalo` | Ryzen AI Max+ 395 (gfx1151, unified mem) | Vulkan | `HSA_OVERRIDE=11.5.1` + UMA (ROCm), ctx 128k |
+
+The run scripts are **generic**: they contain no per-model logic. Both `runtime/rocm/run-rocm.sh` and `runtime/vulkan/run-vulkan.sh` take a model **config name** (or a raw `.gguf` path), inject two env files, mount the models dir read-only, and expose `llama-server` on `http://localhost:8080`:
+
+- `profiles/<MACHINE>.env` — card / machine config (GFX override, UMA, device pinning, ctx/batch).
+- `models/<name>.env` — per-model config (model path, sampling flags, KV cache type, `n-cpu-moe`).
+
+Set your machine once in `~/.bashrc` / `~/.zshrc`, then name the model:
 
 ```sh
-./run-rocm.sh glm-4.7-flash/GLM-4.7-Flash-Q4_K_M.gguf
-./run-vulkan.sh glm-4.7-flash/GLM-4.7-Flash-Q4_K_M.gguf
+export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo
 
-# Pass extra llama-server flags after the model path
-./run-rocm.sh path/to/model.gguf --temp 0.7 --top-p 0.9
-
-# Override defaults via env
-MODELS_DIR=/mnt/llm PORT=9090 CTX_SIZE=8192 ./run-vulkan.sh mistral/mistral-7b-instruct-q4_k_m.gguf
+./runtime/rocm/run-rocm.sh glm-4.7-flash
+./runtime/rocm/run-rocm.sh qwen3-27b --temp 0.7 --top-p 0.9   # extra flags pass through, last wins
 ```
 
-Env overrides supported by both scripts: `MODELS_DIR`, `PORT`, `IMAGE`, `CTX_SIZE`, `UBATCH`, `BATCH`, `THREADS`.
+Or select the machine per-invocation (overrides the global), and run any model on either backend:
+
+```sh
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
+MACHINE=r9700     ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192   # raw path
+```
+
+**Precedence** (highest first): trailing CLI args > inline `MACHINE=…` / `CTX_SIZE=…` > `PODMAN_LLAMA_*` global > `models/<name>.env` > `profiles/<MACHINE>.env` > built-in default.
+
+Overridable vars (inline or `PODMAN_LLAMA_`-prefixed global): `MACHINE`, `MODELS_DIR`, `PORT`, `IMAGE` (`PODMAN_LLAMA_ROCM_IMAGE`/`_VULKAN_IMAGE`), `CTX_SIZE`, `UBATCH`, `BATCH`, `THREADS`, `GPU_INDEX` (Vulkan), plus `CACHE_TYPE_K`, `CACHE_TYPE_V`, `FLASH_ATTN`, `PARALLEL`, `N_CPU_MOE`. See [commands.txt](commands.txt) for the full model list and download commands.
+
+### Per-model tuning
+
+Each model's sampling and KV-cache flags live in [`models/<name>.env`](models/) — the launchers apply no per-model defaults themselves. Edit a model's `.env` to retune it; no script changes needed. Any flag you append on the command line is passed to `llama-server` **after** the model env's, so it overrides (last occurrence wins).
+
+| Model | KV cache | Sampling | Why |
+| --- | --- | --- | --- |
+| gpt-oss-20b | `f16` | `temp 1.0, top-p 1.0`, `--reasoning-format auto` | MXFP4 weights + sliding-window layers lose quality under KV quant; OpenAI's recommended sampling |
+| Qwen3.6-27B | `q8_0` | `temp 0.6, top-p 0.95, top-k 20, min-p 0`, `presence-penalty 1.0` | Qwen3 thinking-mode defaults; presence penalty curbs looping |
+| GLM-4.7-Flash | `q8_0` | `temp 0.7, top-p 1.0, min-p 0.01` | Zhipu's recommended sampling |
+| Devstral-24B | `q8_0` | `temp 0.15, top-p 1.0` | near-deterministic output for coding/agentic use |
+| Qwen3-Coder-Next | `q8_0` | `temp 0.7, top-p 0.8, top-k 20, repeat-penalty 1.05` | 80B MoE (~46 GiB) → `--n-cpu-moe 40`; Strix Halo only |
+
+> On AMD (both ROCm and Vulkan/RADV) the fused flash-attention kernel only engages when K and V use the **same** cache type. Keep `CACHE_TYPE_K == CACHE_TYPE_V`; the wrappers already do.
 
 ## Host prerequisites
 

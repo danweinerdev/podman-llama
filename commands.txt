@@ -1,0 +1,103 @@
+########################################################################
+# podman-llama — model download + launch cheatsheet
+#
+# Two target machines:
+#   r9700      AMD Radeon AI PRO R9700   (gfx1201, RDNA4, ~31 GiB dedicated VRAM) -> ROCm
+#   strixhalo  Ryzen AI Max+ 395         (gfx1151, Radeon 8060S, unified memory)  -> Vulkan
+#
+# Downloads go to /data/models/<Model>/ (the default MODELS_DIR).
+#
+# The run scripts are GENERIC. All tuning is injected from env files:
+#   profiles/<MACHINE>.env  -> card / machine config (GFX, UMA, ctx/batch, device pinning)
+#   models/<MODEL>.env      -> per-model config (path, sampling, KV cache, n-cpu-moe)
+# Invoke as:  MACHINE=<machine> ./runtime/<backend>/run-<backend>.sh <model> [extra args...]
+########################################################################
+
+
+########################################################################
+# Radeon AI PRO R9700 (ROCm)
+########################################################################
+
+# --- downloads ---
+hf download unsloth/Qwen3.6-27B-GGUF --include "*Q6_K*" --local-dir /data/models/Qwen3.6-27B
+hf download unsloth/GLM-4.7-Flash-GGUF --include "*UD-Q5_K_XL*" --local-dir /data/models/GLM-4.7-Flash
+hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-mxfp4.gguf --local-dir /data/models/gpt-oss-20b
+hf download unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF --include "*Q6_K*" --local-dir /data/models/Devstral-Small-2-24B
+
+# --- run (set MACHINE=r9700, or export PODMAN_LLAMA_MACHINE=r9700 once — see below) ---
+MACHINE=r9700 ./runtime/rocm/run-rocm.sh qwen3-27b
+MACHINE=r9700 ./runtime/rocm/run-rocm.sh glm-4.7-flash
+MACHINE=r9700 ./runtime/rocm/run-rocm.sh gpt-oss-20b
+MACHINE=r9700 ./runtime/rocm/run-rocm.sh devstral-24b
+
+# The model arg names models/<name>.env. Extra llama-server flags pass through and
+# OVERRIDE the model env (last wins):
+#   MACHINE=r9700 ./runtime/rocm/run-rocm.sh qwen3-27b --temp 0.7 --top-p 0.8
+# Override tuning inline:
+#   CTX_SIZE=65536 PORT=9090 MACHINE=r9700 ./runtime/rocm/run-rocm.sh glm-4.7-flash
+# Raw .gguf path (no model env, launcher defaults apply):
+#   MACHINE=r9700 ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192
+
+
+########################################################################
+# Strix Halo (Vulkan)
+########################################################################
+
+# --- downloads ---
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "*UD-Q5_K_M*" --local-dir /data/models/Qwen3-Coder-Next
+
+# --- run (MACHINE=strixhalo is the default; shown explicit for clarity) ---
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
+
+# The R9700 models also run here via the Vulkan runtime (download them as above):
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-27b
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh glm-4.7-flash
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh gpt-oss-20b
+
+
+########################################################################
+# Global shell profile (set your machine once)
+########################################################################
+# Add to ~/.bashrc or ~/.zshrc so you never type MACHINE= again:
+#
+#   export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo
+#
+# Optional global overrides (all fall back to the machine profile if unset):
+#   export PODMAN_LLAMA_MODELS_DIR=/data/models
+#   export PODMAN_LLAMA_PORT=8080
+#   export PODMAN_LLAMA_ROCM_IMAGE=llama-strix-halo:rocm
+#   export PODMAN_LLAMA_VULKAN_IMAGE=llama-strix-halo:vulkan
+#   export PODMAN_LLAMA_CTX_SIZE=32768
+#   export PODMAN_LLAMA_UBATCH=2048
+#   export PODMAN_LLAMA_BATCH=8192
+#   export PODMAN_LLAMA_THREADS=8
+#   export PODMAN_LLAMA_GPU_INDEX=0          # vulkan only, multi-GPU hosts
+#
+# With the global set, just:  ./runtime/rocm/run-rocm.sh glm-4.7-flash
+
+
+########################################################################
+# Per-model config (models/<name>.env)
+########################################################################
+# model              KV cache   sampling                                      notes
+# -----------------  ---------  --------------------------------------------  --------------------------
+# gpt-oss-20b        f16/f16    --temp 1.0 --top-p 1.0 --reasoning-format auto MXFP4+SWA: do NOT quant KV
+# qwen3-27b          q8_0/q8_0  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0   +presence-penalty 1.0
+# glm-4.7-flash      q8_0/q8_0  --temp 0.7 --top-p 1.0 --min-p 0.01
+# devstral-24b       q8_0/q8_0  --temp 0.15 --top-p 1.0                        low temp for coding
+# qwen3-coder-next   q8_0/q8_0  --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    --n-cpu-moe 40 (80B MoE)
+#
+# Edit tuning by editing models/<name>.env — no script changes needed.
+# Knobs a model env may set: MODEL, CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN, UBATCH, BATCH,
+#   N_CPU_MOE, PARALLEL, plus a LLAMA_ARGS+=(...) line for sampling flags.
+# On AMD keep CACHE_TYPE_K == CACHE_TYPE_V so the fused flash-attn kernel stays on the fast path.
+
+
+########################################################################
+# Precedence (highest first)
+########################################################################
+#   trailing CLI args  >  inline env  >  models/<name>.env  >  profiles/<MACHINE>.env  >  built-in default
+#
+# Run any model on the other machine by flipping MACHINE:
+#   MACHINE=strixhalo ./runtime/rocm/run-rocm.sh glm-4.7-flash     # ROCm on Strix Halo
+#   MACHINE=r9700     ./runtime/vulkan/run-vulkan.sh qwen3-27b     # Vulkan on the R9700
