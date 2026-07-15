@@ -8,8 +8,9 @@
 # Downloads go to /data/models/<Model>/ (the default MODELS_DIR).
 #
 # The run scripts are GENERIC. All tuning is injected from env files:
-#   profiles/<MACHINE>.env  -> card / machine config (GFX, UMA, ctx/batch, device pinning)
-#   models/<MODEL>.env      -> per-model config (path, sampling, KV cache, n-cpu-moe)
+#   models/<MODEL>.env               -> model-intrinsic only (path, sampling)
+#   profiles/<MACHINE>/<MODEL>.env   -> optional GPU-specific fit (ctx/ubatch/KV/offload/split)
+#   profiles/<MACHINE>/default.env   -> card / machine defaults (GFX, UMA, ctx/batch, device pinning)
 # Invoke as:  MACHINE=<machine> ./runtime/<backend>/run-<backend>.sh <model> [extra args...]
 ########################################################################
 
@@ -56,11 +57,32 @@ MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh gpt-oss-20b
 
 
 ########################################################################
+# Dual Radeon AI PRO R9700 (Vulkan, model spanned across both cards)
+########################################################################
+# Two R9700s (~62 GiB VRAM total) span one model across both cards via
+# --split-mode/--tensor-split, all weights in VRAM (no CPU-MoE offload).
+# GPU-fit tuning lives in profiles/r9700-dual/<model>.env.
+
+# --- downloads ---
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "*Q4_1*"     --local-dir /data/models/Qwen3-Coder-Next
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "*UD-Q5_K_M*" --local-dir /data/models/Qwen3-Coder-Next
+
+# --- run ---
+# Q4_1 (~47 GiB) at the model's native 256k context (default for this profile):
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4
+# Q5_K_M (~56 GiB) fits too, but leaves little KV room -> 32k context:
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
+# If load OOMs, shrink the compute buffer first, then context:
+#   UBATCH=256 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4
+# Uneven split (e.g. one card drives a display): TENSOR_SPLIT=0.9,1.1
+
+
+########################################################################
 # Global shell profile (set your machine once)
 ########################################################################
 # Add to ~/.bashrc or ~/.zshrc so you never type MACHINE= again:
 #
-#   export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo
+#   export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo, r9700-dual
 #
 # Optional global overrides (all fall back to the machine profile if unset):
 #   export PODMAN_LLAMA_MODELS_DIR=/data/models
@@ -77,27 +99,33 @@ MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh gpt-oss-20b
 
 
 ########################################################################
-# Per-model config (models/<name>.env)
+# Per-model config (models/<name>.env — model-intrinsic: path + sampling)
 ########################################################################
-# model              KV cache   sampling                                      notes
-# -----------------  ---------  --------------------------------------------  --------------------------
-# gpt-oss-20b        f16/f16    --temp 1.0 --top-p 1.0 --reasoning-format auto MXFP4+SWA: do NOT quant KV
-# qwen3-27b          q8_0/q8_0  --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0   +presence-penalty 1.0
-# glm-4.7-flash      q8_0/q8_0  --temp 0.7 --top-p 1.0 --min-p 0.01
-# devstral-24b       q8_0/q8_0  --temp 0.15 --top-p 1.0                        low temp for coding
-# qwen3-coder-next   q8_0/q8_0  --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    --n-cpu-moe 40 (80B MoE)
+# model                sampling                                       notes
+# -------------------  ---------------------------------------------  --------------------------
+# gpt-oss-20b          --temp 1.0 --top-p 1.0 --reasoning-format auto MXFP4+SWA: f16 KV (in model env)
+# qwen3-27b            --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0   +presence-penalty 1.0
+# glm-4.7-flash        --temp 0.7 --top-p 1.0 --min-p 0.01
+# devstral-24b         --temp 0.15 --top-p 1.0                        low temp for coding
+# qwen3-coder-next     --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    80B MoE (Q5_K_M, ~56 GiB)
+# qwen3-coder-next-q4  --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    80B MoE (Q4_1, ~47 GiB)
 #
-# Edit tuning by editing models/<name>.env — no script changes needed.
-# Knobs a model env may set: MODEL, CACHE_TYPE_K, CACHE_TYPE_V, FLASH_ATTN, UBATCH, BATCH,
-#   N_CPU_MOE, PARALLEL, plus a LLAMA_ARGS+=(...) line for sampling flags.
+# models/<name>.env carries ONLY the weight path + sampling. GPU-specific fit
+# (CPU-MoE offload, context, KV quant, multi-GPU split) lives per card in
+# profiles/<MACHINE>/<name>.env, e.g.:
+#   profiles/strixhalo/qwen3-coder-next.env    -> --n-cpu-moe 40 (offload to unified RAM)
+#   profiles/r9700-dual/qwen3-coder-next-q4.env -> ctx 256k, ubatch 512, q4_0 V-cache
 # On AMD keep CACHE_TYPE_K == CACHE_TYPE_V so the fused flash-attn kernel stays on the fast path.
 
 
 ########################################################################
 # Precedence (highest first)
 ########################################################################
-#   trailing CLI args  >  inline env  >  models/<name>.env  >  profiles/<MACHINE>.env  >  built-in default
+#   trailing CLI args  >  inline env  >  models/<name>.env
+#     >  profiles/<MACHINE>/<name>.env  >  profiles/<MACHINE>/default.env  >  built-in default
+# (Env files use := "set if unset", so the FIRST assignment of each var wins; the
+#  launchers source in precedence order so earlier files pin and later ones fill gaps.)
 #
-# Run any model on the other machine by flipping MACHINE:
+# Run any model on another machine by flipping MACHINE:
 #   MACHINE=strixhalo ./runtime/rocm/run-rocm.sh glm-4.7-flash     # ROCm on Strix Halo
-#   MACHINE=r9700     ./runtime/vulkan/run-vulkan.sh qwen3-27b     # Vulkan on the R9700
+#   MACHINE=r9700     ./runtime/vulkan/run-vulkan.sh qwen3-27b     # Vulkan on one R9700

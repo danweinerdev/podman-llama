@@ -1,0 +1,8 @@
+{
+  "prefersReducedMotion": true,
+  "permissions": {
+    "allow": [
+      "WebSearch"
+    ]
+  }
+}

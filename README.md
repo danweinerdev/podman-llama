@@ -16,8 +16,8 @@ Two backends are provided:
 | [Makefile](Makefile) | `make build-rocm` / `make build-vulkan` / `make all` |
 | [runtime/rocm/run-rocm.sh](runtime/rocm/run-rocm.sh) | Generic `llama-server` launcher (ROCm) — no per-model logic |
 | [runtime/vulkan/run-vulkan.sh](runtime/vulkan/run-vulkan.sh) | Generic `llama-server` launcher (Vulkan) — no per-model logic |
-| [profiles/](profiles/) | Per-card / per-machine env config (`r9700.env`, `strixhalo.env`) |
-| [models/](models/) | Per-model env config (path, sampling, KV cache, `n-cpu-moe`) |
+| [profiles/](profiles/) | Per-GPU env config: `profiles/<MACHINE>/default.env` (card defaults) + optional `profiles/<MACHINE>/<model>.env` (GPU-specific fit tuning) |
+| [models/](models/) | Per-model env config, model-intrinsic only (path, sampling) |
 | [commands.txt](commands.txt) | Model download + launch cheatsheet |
 
 ## Build
@@ -36,22 +36,26 @@ podman build --build-arg LLAMA_TAG=b4400 -t llama-strix-halo:rocm -f Containerfi
 
 ## Run
 
-Two machines are supported via env **profiles** in [profiles/](profiles/):
+Machines are supported via env **profiles** in [profiles/](profiles/):
 
 | `MACHINE` | Hardware | Backend | Key tuning |
 | --- | --- | --- | --- |
-| `r9700` | Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GiB VRAM) | ROCm | native gfx1201, discrete-GPU pinning, ctx 32k |
+| `r9700` | 1× Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GiB VRAM) | ROCm | native gfx1201, discrete-GPU pinning, ctx 32k |
+| `r9700-dual` | 2× Radeon AI PRO R9700 (~62 GiB VRAM total) | Vulkan | multi-GPU `--tensor-split`, all-VRAM (no CPU-MoE), e.g. Qwen-Next Q4_1 @ 256k |
 | `strixhalo` | Ryzen AI Max+ 395 (gfx1151, unified mem) | Vulkan | `HSA_OVERRIDE=11.5.1` + UMA (ROCm), ctx 128k |
 
-The run scripts are **generic**: they contain no per-model logic. Both `runtime/rocm/run-rocm.sh` and `runtime/vulkan/run-vulkan.sh` take a model **config name** (or a raw `.gguf` path), inject two env files, mount the models dir read-only, and expose `llama-server` on `http://localhost:8080`:
+The run scripts are **generic**: they contain no per-model logic. Both `runtime/rocm/run-rocm.sh` and `runtime/vulkan/run-vulkan.sh` take a model **config name** (or a raw `.gguf` path), inject up to three env files, mount the models dir read-only, and expose `llama-server` on `http://localhost:8080`:
 
-- `profiles/<MACHINE>.env` — card / machine config (GFX override, UMA, device pinning, ctx/batch).
-- `models/<name>.env` — per-model config (model path, sampling flags, KV cache type, `n-cpu-moe`).
+- `models/<name>.env` — **model-intrinsic** config only: weight path + sampling flags.
+- `profiles/<MACHINE>/<name>.env` — *optional* **GPU-specific fit** for that model on that card (context, ubatch, KV quant, CPU-MoE offload, split). Absent ⇒ the card defaults are used as-is.
+- `profiles/<MACHINE>/default.env` — **card / machine defaults** (GFX override, UMA, device pinning, split, ctx/batch baseline).
+
+The split keeps model identity separate from hardware fit: the same `models/<name>.env` runs on every card, and each card decides how to make it fit via its own per-model profile.
 
 Set your machine once in `~/.bashrc` / `~/.zshrc`, then name the model:
 
 ```sh
-export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo
+export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo, r9700-dual
 
 ./runtime/rocm/run-rocm.sh glm-4.7-flash
 ./runtime/rocm/run-rocm.sh qwen3-27b --temp 0.7 --top-p 0.9   # extra flags pass through, last wins
@@ -60,17 +64,22 @@ export PODMAN_LLAMA_MACHINE=r9700        # or strixhalo
 Or select the machine per-invocation (overrides the global), and run any model on either backend:
 
 ```sh
-MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
-MACHINE=r9700     ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192   # raw path
+MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4   # Qwen-Next Q4_1 across both R9700s @ 256k
+MACHINE=r9700      ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192   # raw path
 ```
 
-**Precedence** (highest first): trailing CLI args > inline `MACHINE=…` / `CTX_SIZE=…` > `PODMAN_LLAMA_*` global > `models/<name>.env` > `profiles/<MACHINE>.env` > built-in default.
+**Precedence** (highest first): trailing CLI args > inline `MACHINE=…` / `CTX_SIZE=…` > `PODMAN_LLAMA_*` global > `models/<name>.env` > `profiles/<MACHINE>/<name>.env` > `profiles/<MACHINE>/default.env` > built-in default.
+
+(Env files use `:=` "set if unset", so the **first** assignment of each var wins. The launchers source in precedence order — model env, then per-model profile, then card default — so earlier files pin a value and later ones only fill gaps.)
 
 Overridable vars (inline or `PODMAN_LLAMA_`-prefixed global): `MACHINE`, `MODELS_DIR`, `PORT`, `IMAGE` (`PODMAN_LLAMA_ROCM_IMAGE`/`_VULKAN_IMAGE`), `CTX_SIZE`, `UBATCH`, `BATCH`, `THREADS`, `GPU_INDEX` (Vulkan), plus `CACHE_TYPE_K`, `CACHE_TYPE_V`, `FLASH_ATTN`, `PARALLEL`, `N_CPU_MOE`. See [commands.txt](commands.txt) for the full model list and download commands.
 
 ### Per-model tuning
 
-Each model's sampling and KV-cache flags live in [`models/<name>.env`](models/) — the launchers apply no per-model defaults themselves. Edit a model's `.env` to retune it; no script changes needed. Any flag you append on the command line is passed to `llama-server` **after** the model env's, so it overrides (last occurrence wins).
+A model's identity (weight path + sampling) lives in [`models/<name>.env`](models/); how it *fits a given card* (context, ubatch, KV quant, CPU-MoE offload, multi-GPU split) lives in [`profiles/<MACHINE>/<name>.env`](profiles/) when the card needs model-specific tuning. The launchers apply no per-model defaults themselves. Retune by editing the relevant `.env`; no script changes needed. Any flag you append on the command line is passed to `llama-server` **after** both, so it overrides (last occurrence wins).
+
+Passing a raw `.gguf` path instead of a config name skips **both** the model env and the per-model profile — only `profiles/<MACHINE>/default.env` and CLI flags apply.
 
 | Model | KV cache | Sampling | Why |
 | --- | --- | --- | --- |

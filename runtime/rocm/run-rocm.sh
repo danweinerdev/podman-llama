@@ -4,8 +4,9 @@ set -euo pipefail
 # Generic ROCm/HIP llama-server launcher.
 #
 # All tuning lives in injectable env files, none in this script:
-#   - card / machine config -> profiles/<MACHINE>.env   (GFX override, UMA, device pinning, ctx/batch)
-#   - per-model config      -> models/<MODEL_CONF>.env  (model path, sampling, KV cache, n-cpu-moe)
+#   - model-intrinsic config -> models/<MODEL_CONF>.env             (model path, sampling, n-cpu-moe)
+#   - GPU-specific model fit  -> profiles/<MACHINE>/<MODEL_CONF>.env (optional: ctx/ubatch/KV to fit this model on this card)
+#   - card / machine defaults -> profiles/<MACHINE>/default.env     (GFX override, UMA, device pinning, ctx/batch baseline)
 #
 # Usage:
 #   MACHINE=<machine> ./run-rocm.sh <model-conf>            # named model, e.g. gpt-oss-20b
@@ -13,7 +14,10 @@ set -euo pipefail
 # Anything after the model arg is passed straight through to llama-server and overrides
 # both the model env file and the launcher (llama-server takes the last occurrence).
 #
-# Precedence (highest first): trailing CLI args > inline env > model env > machine profile > built-in.
+# Precedence (highest first): trailing CLI args > inline env > model env
+#   > profiles/<MACHINE>/<model>.env > profiles/<MACHINE>/default.env > built-in.
+# (Env files use `:=`, so the FIRST source of each var wins; sourcing order below
+#  matches this precedence -- model env, then per-model profile, then card default.)
 
 if [[ $# -lt 1 ]]; then
     echo "Usage: MACHINE=<machine> $0 <model-conf|model-path> [extra llama-server args...]" >&2
@@ -60,12 +64,23 @@ else
 fi
 
 # --- inject card / machine config --------------------------------------------
+# Each GPU type is a directory: profiles/<MACHINE>/default.env holds card-generic
+# settings, and an optional profiles/<MACHINE>/<model>.env holds tuning to fit that
+# specific model on this card. The per-model profile is sourced BEFORE default.env
+# so its `:=` values win over the card defaults (but CLI/env, sourced earlier, win
+# over both).
 MACHINE="${MACHINE:-strixhalo}"
-PROFILE="${REPO_ROOT}/profiles/${MACHINE}.env"
+PROFILE_DIR="${REPO_ROOT}/profiles/${MACHINE}"
+PROFILE="${PROFILE_DIR}/default.env"
 if [[ ! -f "$PROFILE" ]]; then
     echo "Unknown MACHINE='${MACHINE}': no profile at ${PROFILE}" >&2
-    echo "Available: $(cd "${REPO_ROOT}/profiles" && ls *.env | sed 's/\.env$//' | paste -sd' ')" >&2
+    echo "Available: $(cd "${REPO_ROOT}/profiles" && ls -d */ 2>/dev/null | sed 's#/##' | paste -sd' ')" >&2
     exit 1
+fi
+# Optional GPU-specific per-model overrides (skipped for raw .gguf paths).
+if [[ "$MODEL_ARG" != *.gguf && -f "${PROFILE_DIR}/${MODEL_ARG}.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${PROFILE_DIR}/${MODEL_ARG}.env"
 fi
 # shellcheck disable=SC1090
 source "$PROFILE"
