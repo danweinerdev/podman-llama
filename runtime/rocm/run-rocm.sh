@@ -110,7 +110,15 @@ env_args=()
 mmap_args=()
 [[ "${NO_MMAP:-0}" == "1" ]] && mmap_args+=(--no-mmap)
 
-podman run --rm -it \
+# Hold a systemd sleep inhibitor for the lifetime of the container so the host
+# doesn't suspend mid-inference. The lock is released automatically when
+# podman run exits (normally or via Ctrl-C).
+systemd-inhibit \
+    --what=sleep \
+    --who="run-rocm" \
+    --why="llama-server (${MODEL:-model}) is running" \
+    --mode=block \
+    podman run --rm -it \
     --device /dev/kfd \
     --device /dev/dri \
     --group-add keep-groups \
