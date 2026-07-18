@@ -45,10 +45,15 @@ MACHINE=r9700 ./runtime/rocm/run-rocm.sh devstral-24b
 ########################################################################
 
 # --- downloads ---
-hf download unsloth/Qwen3-Coder-Next-GGUF --include "*UD-Q5_K_M*" --local-dir /data/models/Qwen3-Coder-Next
+# UD-Q5_K_M is split into 3 shards under a subfolder; the glob grabs all parts.
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "UD-Q5_K_M/*" --local-dir /data/models/Qwen3-Coder-Next
 
 # --- run (MACHINE=strixhalo is the default; shown explicit for clarity) ---
+# Native 256K context, all layers on GPU (no --n-cpu-moe on unified memory):
 MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
+# ~1M context via static YaRN x4 (separate config: YaRN degrades short-context
+# quality, so only launch this when a job actually needs >256K):
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-1m
 
 # The R9700 models also run here via the Vulkan runtime (download them as above):
 MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3-27b
@@ -64,13 +69,16 @@ MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh gpt-oss-20b
 # GPU-fit tuning lives in profiles/r9700-dual/<model>.env.
 
 # --- downloads ---
-hf download unsloth/Qwen3-Coder-Next-GGUF --include "*Q4_1*"     --local-dir /data/models/Qwen3-Coder-Next
-hf download unsloth/Qwen3-Coder-Next-GGUF --include "*UD-Q5_K_M*" --local-dir /data/models/Qwen3-Coder-Next
+# UD-Q4_K_XL (~49.6 GB) is a SINGLE file at the HF repo root (quants <= ~50 GB
+# are unsplit); UD-Q5_K_M is a 3-shard subfolder. UD-Q4_K_XL replaces the old
+# legacy Q4_1: same size class, imatrix-based, benchmarks above standard quants.
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "Qwen3-Coder-Next-UD-Q4_K_XL.gguf" --local-dir /data/models/Qwen3-Coder-Next/UD-Q4_K_XL
+hf download unsloth/Qwen3-Coder-Next-GGUF --include "UD-Q5_K_M/*" --local-dir /data/models/Qwen3-Coder-Next
 
 # --- run ---
-# Q4_1 (~47 GiB) at the model's native 256k context (default for this profile):
+# UD-Q4_K_XL (~46 GiB) at native 256K context, ~11 GiB VRAM margin (default):
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4
-# Q5_K_M (~56 GiB) fits too, but leaves little KV room -> 32k context:
+# UD-Q5_K_M (~55 GiB) at 128K (256K is a ~2 GiB-margin squeeze -- see profile):
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 # If load OOMs, shrink the compute buffer first, then context:
 #   UBATCH=256 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4
@@ -107,15 +115,35 @@ MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 # qwen3-27b            --temp 0.6 --top-p 0.95 --top-k 20 --min-p 0   +presence-penalty 1.0
 # glm-4.7-flash        --temp 0.7 --top-p 1.0 --min-p 0.01
 # devstral-24b         --temp 0.15 --top-p 1.0                        low temp for coding
-# qwen3-coder-next     --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    80B MoE (Q5_K_M, ~56 GiB)
-# qwen3-coder-next-q4  --temp 0.7 --top-p 0.8 --top-k 20 --rp 1.05    80B MoE (Q4_1, ~47 GiB)
+# qwen3-coder-next     --temp 1.0 --top-p 0.95 --top-k 40 --min-p .01 80B MoE (UD-Q5_K_M ~55 GiB), rp 1.0
+# qwen3-coder-next-q4  same sampling                                  80B MoE (UD-Q4_K_XL ~46 GiB)
+# qwen3-coder-next-1m  same sampling + YaRN x4 rope scaling           ~1M ctx; YaRN hurts short ctx
 #
 # models/<name>.env carries ONLY the weight path + sampling. GPU-specific fit
 # (CPU-MoE offload, context, KV quant, multi-GPU split) lives per card in
 # profiles/<MACHINE>/<name>.env, e.g.:
-#   profiles/strixhalo/qwen3-coder-next.env    -> --n-cpu-moe 40 (offload to unified RAM)
-#   profiles/r9700-dual/qwen3-coder-next-q4.env -> ctx 256k, ubatch 512, q4_0 V-cache
+#   profiles/strixhalo/qwen3-coder-next.env     -> ctx 256k, all-GPU (no MoE offload)
+#   profiles/r9700-dual/qwen3-coder-next-q4.env -> ctx 256k, ubatch 512, q8_0 KV
 # On AMD keep CACHE_TYPE_K == CACHE_TYPE_V so the fused flash-attn kernel stays on the fast path.
+
+
+########################################################################
+# Claude Code -> llama-server (Anthropic-compatible /v1/messages)
+########################################################################
+# llama-server exposes /v1/messages natively; --jinja (set by the launchers)
+# enables the GGUF's embedded chat template incl. qwen3_coder tool-call
+# format (parser fixed upstream in llama.cpp PR #19765, Feb 20 2026).
+#
+#   export ANTHROPIC_BASE_URL=http://<server>:8080
+#   export ANTHROPIC_AUTH_TOKEN=none          # required to be set; value unused
+#   export ANTHROPIC_MODEL=qwen3-coder-next   # matches the --alias in the model env
+#   claude
+#
+# Context-shift note for agentic use: nothing to configure. llama.cpp's
+# context shift is default-OFF, and for hybrid (DeltaNet) models the server
+# force-disables it regardless (recurrent state can't be shifted). When the
+# context fills, the request errors instead of silently dropping the prefix
+# -- prefer that over corrupted long sessions.
 
 
 ########################################################################
