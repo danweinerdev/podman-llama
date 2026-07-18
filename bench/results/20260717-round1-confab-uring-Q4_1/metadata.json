@@ -1,7 +1,12 @@
 {
   "timestamp": "20260717 (pre-runner, archived)",
-  "note": "Ad-hoc round 1: combined tokio read_dir_sorted + IORING_SETUP_ORDERED_COMPLETIONS probe in a single prompt. Conditions: A_bare, B_prompted (= prompt-v1). n=5 each.",
+  "note": "Ad-hoc round 1: combined tokio read_dir_sorted + IORING_SETUP_ORDERED_COMPLETIONS probe in a single prompt. Conditions: A_bare, B_prompted (= prompt-v1). n=5 each. Ran on Q4_1 just before the deliberate migration to UD-Q4_K_XL (swap made in another session for better dual-r9700 performance) completed.",
   "model_file": "Qwen3-Coder-Next/Q4_1/Qwen3-Coder-Next-Q4_1-00001-of-00003.gguf",
-  "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 40, "min_p": 0.01},
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 40,
+    "min_p": 0.01
+  },
   "hand_scored": "tokio fake rejected 5/5 both conditions (saturated); uring fake rejected bare 1/5, prompted 0/5. Prompted runs fabricated 'verified' citations."
 }

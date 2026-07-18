@@ -36,9 +36,11 @@ Requires only python3 stdlib and a healthy server (default
 1. **Keyword columns are triage, not scores.** Outputs routinely contain
    rejection language AND use the fake API in code, or quote the fake token
    inside a grep suggestion. Hand-read before concluding anything.
-2. **Record the quant.** The server has come back from restarts with
-   different weights (Q4_1 vs UD-Q4_K_XL) behaving measurably differently.
-   `metadata.json` captures this; never compare runs whose model files differ.
+2. **Record the quant.** The 2026-07-17 rounds straddled the deliberate
+   migration from Q4_1 to UD-Q4_K_XL (chosen for better performance on the
+   dual-r9700 profile) — round 1 caught the outgoing quant, and the two
+   behave measurably differently. `metadata.json` captures the model file;
+   never compare runs whose model files differ.
 3. **n=5 at temp=1.0 is a smoke test, not statistics.** Effects smaller than
    ~2/5 need more runs.
 4. **Traps the model can refute from memory measure knowledge, not
