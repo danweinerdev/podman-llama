@@ -114,6 +114,9 @@ MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b
 MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m
 
 # --- run: dual R9700 (~62 GiB VRAM, split across both cards) ---
+# These profiles default to --split-mode row (the card default is layer).
+# Dense models idle one card under layer mode; measured on Q8, row is +32.8%
+# prefill / +9.5% decode and evens out VRAM. A/B it back with SPLIT_MODE=layer.
 # Q8 @ native 262K, ~40 GiB used -- the full-context option here:
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8
 # BF16 @ 131K. NOT 262K: that lands at ~62 GiB against a ~62 GiB ceiling with

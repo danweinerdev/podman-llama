@@ -110,6 +110,8 @@ Why the gaps: BF16 at 262,144 on the pair needs ~62 GiB against a ~62 GiB ceilin
 
 Download commands are in [commands.txt](commands.txt); the budgets above are arithmetic, not measured.
 
+**Split mode on `r9700-dual`:** these profiles override the card default to `--split-mode row`. Layer mode assigns whole layers per card, so a *dense* model leaves one card idle while the other computes; row mode splits each tensor so both work at once. Measured on the Q8 config — prefill 74.23 → 98.56 t/s (**+32.8%**), decode 15.75 → 17.24 t/s (**+9.5%**) — and it relieves a VRAM imbalance that left GPU[0] at 97% allocated vs GPU[1] at 68%. Decode gains little because single-stream decode is bandwidth-bound: ~29.3 GiB of Q8 weights per token against ~640 GB/s caps a single card near 21 t/s, so 17.24 is ~82% of the practical ceiling. The Coder-Next profiles deliberately stay on `layer` (80B MoE, ~3B active — different traffic pattern, untested). Override inline with `SPLIT_MODE=layer`.
+
 ```bash
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b        # BF16 @ 262K
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m     # YaRN x4 @ 1M
