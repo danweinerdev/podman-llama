@@ -73,7 +73,31 @@ MACHINE=r9700      ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 81
 
 (Env files use `:=` "set if unset", so the **first** assignment of each var wins. The launchers source in precedence order — model env, then per-model profile, then card default — so earlier files pin a value and later ones only fill gaps.)
 
-Overridable vars (inline or `PODMAN_LLAMA_`-prefixed global): `MACHINE`, `MODELS_DIR`, `PORT`, `IMAGE` (`PODMAN_LLAMA_ROCM_IMAGE`/`_VULKAN_IMAGE`), `CTX_SIZE`, `UBATCH`, `BATCH`, `THREADS`, `GPU_INDEX` (Vulkan), plus `CACHE_TYPE_K`, `CACHE_TYPE_V`, `FLASH_ATTN`, `PARALLEL`, `N_CPU_MOE`. See [commands.txt](commands.txt) for the full model list and download commands.
+Overridable vars (inline or `PODMAN_LLAMA_`-prefixed global): `MACHINE`, `MODELS_DIR`, `PORT`, `IMAGE` (`PODMAN_LLAMA_ROCM_IMAGE`/`_VULKAN_IMAGE`), `CTX_SIZE`, `UBATCH`, `BATCH`, `THREADS`, `GPU_INDEX` (Vulkan), `METRICS`, plus `CACHE_TYPE_K`, `CACHE_TYPE_V`, `FLASH_ATTN`, `PARALLEL`, `N_CPU_MOE`.
+
+### Watching a running server
+
+Both launchers pass `--metrics` by default, so `llama-server` exposes a Prometheus endpoint. Set `METRICS=0` to turn it off (upstream's own default is disabled — without the flag `/metrics` answers `501`).
+
+| Endpoint | Needs a flag? | Use |
+| --- | --- | --- |
+| `/metrics` | `--metrics` (on by default here) | Prometheus counters: `llamacpp:prompt_tokens_total`, `llamacpp:tokens_predicted_total`, `llamacpp:kv_cache_usage_ratio`, slot counts. For scraping/Grafana. |
+| `/slots` | no (on upstream by default) | Live per-slot state: `is_processing`, `n_prompt_tokens`, `n_decoded`, `n_ctx`. For watching one session. |
+| `/props` | no | Static config readback — confirm split mode, context, and sampling actually took effect. |
+| `/health` | no | Liveness. |
+
+[`scripts/llama-watch.sh`](scripts/llama-watch.sh) polls `/slots` and prints one line per interval (state, prompt tokens, decoded tokens, context used):
+
+```sh
+scripts/llama-watch.sh          # 2s against http://127.0.0.1:8080
+scripts/llama-watch.sh 5 http://otherhost:8080
+```
+
+```
+TIME      STATE   PROMPT     DECODED    CTX%      KV
+16:04:00  BUSY    99268      2018       39.4%     103303/262144
+16:04:02  BUSY    99268      2049       39.4%     103365/262144
+``` See [commands.txt](commands.txt) for the full model list and download commands.
 
 ### Per-model tuning
 

@@ -48,6 +48,7 @@ fallback CTX_SIZE   PODMAN_LLAMA_CTX_SIZE
 fallback UBATCH     PODMAN_LLAMA_UBATCH
 fallback BATCH      PODMAN_LLAMA_BATCH
 fallback THREADS    PODMAN_LLAMA_THREADS
+fallback METRICS    PODMAN_LLAMA_METRICS
 
 # --- inject per-model config -------------------------------------------------
 # If MODEL_ARG names a models/<name>.env, source it (sets MODEL + tuning + LLAMA_ARGS).
@@ -110,6 +111,12 @@ env_args=()
 mmap_args=()
 [[ "${NO_MMAP:-0}" == "1" ]] && mmap_args+=(--no-mmap)
 
+# Prometheus metrics at /metrics, ON by default here (llama-server's own default
+# is disabled -- it answers 501 without this flag). /slots and /props are enabled
+# upstream by default and need no flag. Set METRICS=0 to turn it off.
+metrics_args=()
+[[ "${METRICS:-1}" == "1" ]] && metrics_args+=(--metrics)
+
 # Hold a systemd sleep inhibitor for the lifetime of the container so the host
 # doesn't suspend mid-inference. The lock is released automatically when
 # podman run exits (normally or via Ctrl-C).
@@ -140,6 +147,7 @@ systemd-inhibit \
     --batch-size "${BATCH}" \
     --threads "${THREADS}" \
     "${mmap_args[@]}" \
+    "${metrics_args[@]}" \
     --jinja \
     --host 0.0.0.0 \
     --port 8080 \
