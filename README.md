@@ -41,7 +41,7 @@ Machines are supported via env **profiles** in [profiles/](profiles/):
 | `MACHINE` | Hardware | Backend | Key tuning |
 | --- | --- | --- | --- |
 | `r9700` | 1× Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GiB VRAM) | ROCm | native gfx1201, discrete-GPU pinning, ctx 32k |
-| `r9700-dual` | 2× Radeon AI PRO R9700 (~62 GiB VRAM total) | Vulkan | multi-GPU `--tensor-split`, all-VRAM (no CPU-MoE), e.g. Qwen-Next Q4_1 @ 256k |
+| `r9700-dual` | 2× Radeon AI PRO R9700 (~62 GiB VRAM total) | Vulkan | multi-GPU `--tensor-split`, all-VRAM (no CPU-MoE), e.g. Qwen-Next UD-Q4_K_XL @ 256k |
 | `strixhalo` | Ryzen AI Max+ 395 (gfx1151, unified mem) | Vulkan | `HSA_OVERRIDE=11.5.1` + UMA (ROCm), ctx 128k |
 
 The run scripts are **generic**: they contain no per-model logic. Both `runtime/rocm/run-rocm.sh` and `runtime/vulkan/run-vulkan.sh` take a model **config name** (or a raw `.gguf` path), inject up to three env files, mount the models dir read-only, and expose `llama-server` on `http://localhost:8080`:
@@ -65,7 +65,7 @@ Or select the machine per-invocation (overrides the global), and run any model o
 
 ```sh
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
-MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4   # Qwen-Next Q4_1 across both R9700s @ 256k
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4   # Qwen-Next UD-Q4_K_XL across both R9700s @ 256k
 MACHINE=r9700      ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192   # raw path
 ```
 
@@ -88,8 +88,51 @@ Passing a raw `.gguf` path instead of a config name skips **both** the model env
 | GLM-4.7-Flash | `q8_0` | `temp 0.7, top-p 1.0, min-p 0.01` | Zhipu's recommended sampling |
 | Devstral-24B | `q8_0` | `temp 0.15, top-p 1.0` | near-deterministic output for coding/agentic use |
 | Qwen3-Coder-Next | `q8_0` | `temp 0.7, top-p 0.8, top-k 20, repeat-penalty 1.05` | 80B MoE (~46 GiB) → `--n-cpu-moe 40`; Strix Halo only |
+| Qwen3.8-27B (thinking) | `q8_0` | `temp 1.0, top-p 0.95, top-k 20, min-p 0, presence 0` | Qwen thinking-mode recipe (matches the GGUF's own `general.sampling.*`); thinking is on by default |
+| Qwen3.8-27B (instruct) | `q8_0` | `temp 0.7, top-p 0.80, top-k 20, min-p 0, presence 1.5` | Qwen non-thinking recipe; the high presence penalty is what suppresses loops without a thinking pass |
 
 > On AMD (both ROCm and Vulkan/RADV) the fused flash-attention kernel only engages when K and V use the **same** cache type. Keep `CACHE_TYPE_K == CACHE_TYPE_V`; the wrappers already do.
+
+### Qwen3.8-27B config matrix
+
+Hybrid-attention VL model, arch `qwen35`, native context 262,144. Only 16 of its 65 blocks are full attention (`full_attention_interval 4`); the other 48 are Gated DeltaNet and hold a constant-size SSM state instead of per-token KV. KV therefore costs **~34 KiB/token** at `q8_0` (16 × 4 KV heads × 256 head_dim × K+V), so 262K ≈ 8.5 GiB.
+
+| Config | Weights | `r9700` | `r9700-dual` | `strixhalo` |
+| --- | --- | --- | --- | --- |
+| `qwen3.8-27b` | BF16, 50.9 GiB | — | 131,072 — the practical BF16 ceiling here | **262,144** — flagship placement |
+| `qwen3.8-27b-q8` | UD-Q8_K_XL, 29.3 GiB | — (no room for KV) | **262,144**, ~22 GiB slack | — (use BF16) |
+| `qwen3.8-27b-q4` | UD-Q4_K_XL, 16.7 GiB | **262,144** on one card | — | — |
+| `qwen3.8-27b-1m` | BF16 + YaRN ×4 | — | — | **1,048,576** (~88 GiB) |
+| `qwen3.8-27b-instruct` | UD-Q8_K_XL | — | 262,144 | 262,144 |
+| `qwen3.8-27b-instruct-q4` | UD-Q4_K_XL | 262,144 | — | — |
+
+Why the gaps: BF16 at 262,144 on the pair needs ~62 GiB against a ~62 GiB ceiling — no margin for fragmentation or an uneven layer split, hence 131,072 there. Q8 is 29.3 GiB of weights alone, so on a single 31 GiB card nothing is left for KV; Q4 is what makes one card work. Only Strix Halo's 108 GiB holds BF16 weights *and* a 34 GiB 1M cache.
+
+Download commands are in [commands.txt](commands.txt); the budgets above are arithmetic, not measured.
+
+```bash
+MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b        # BF16 @ 262K
+MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m     # YaRN x4 @ 1M
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8     # Q8 across both cards @ 262K
+MACHINE=r9700      ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q4     # Q4 on one card @ 262K
+```
+
+Two things the CLI cannot control, because they live in the chat template:
+
+- **Thinking is on by default** and emits `<think>…</think>` before the answer. Disabling it requires `chat_template_kwargs: {"enable_thinking": false}` **per request** — the `-instruct` configs only change sampling, so pairing them with a client that doesn't send that flag gives you thinking output under instruct sampling, which is the worst of both.
+- **`reasoning_effort`** (`xhigh` default / `medium` / `low`) and **`preserve_thinking`** are likewise request-side. Lowering `reasoning_effort` does not reliably cut agentic latency; shallower analysis just causes retries.
+
+Vision (image + video) is native but needs the multimodal projector, so every config passes `--mmproj` — BF16 weights pair with `mmproj-BF16.gguf`, quantized weights with `mmproj-F16.gguf`. Without it the server is text-only.
+
+> Unlike the other models here, these quants sit at the model directory root rather than in per-quant subfolders; only the BF16 shards live in `BF16/`.
+
+### Concurrency vs. context length
+
+`--parallel` (env `PARALLEL`, default `1`) sets how many request slots `llama-server` allocates — but it **splits** the KV cache configured by `CTX_SIZE` across those slots rather than multiplying it. Each slot gets `CTX_SIZE / PARALLEL` context, and total VRAM cost scales with `CTX_SIZE x PARALLEL`, not per slot. There is no way to give N concurrent requests each the full configured context from one `llama-server` instance.
+
+With `PARALLEL=1` (the default everywhere in this repo), a single slot serves the entire configured context to one request at a time; a second request arriving mid-generation queues at the HTTP layer and waits — it does not error, it just adds latency. Raising `PARALLEL` trades that queuing delay for reduced context per request (e.g. `PARALLEL=2` on a 256K-context profile caps each request at ~128K).
+
+For large-context models like Qwen3-Coder-Next on `r9700-dual` (see [`profiles/r9700-dual/qwen3-coder-next-q4.env`](profiles/r9700-dual/qwen3-coder-next-q4.env)), VRAM is already nearly fully consumed by one instance's weights + full-context KV cache, so running a second full-context instance for true multi-session parallelism isn't feasible on this hardware — one session at a time, at full context, is the practical ceiling.
 
 ## Host prerequisites
 

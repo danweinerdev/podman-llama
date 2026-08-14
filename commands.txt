@@ -86,6 +86,59 @@ MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 
 
 ########################################################################
+# Qwen3.8-27B (all three machines)
+########################################################################
+# Hybrid-attention VL model (arch qwen35), native 262,144 context, Apache 2.0.
+# Only 16 of its 65 blocks are full attention (full_attention_interval 4); the
+# rest are Gated DeltaNet with a constant-size SSM state, so KV costs
+# ~34 KiB/token at q8_0 -> 262K ~= 8.5 GiB, 1M ~= 34 GiB.
+#
+# Standard ggml-org/llama.cpp master is enough. The unslothai iq1-narrow branch
+# is only for the 2.4T model's sub-IQ1_S dtypes, NOT this one.
+
+# --- downloads ---
+# NOTE: unlike the other models here, these quants sit at the model dir ROOT
+# (that is how they were pulled); only the BF16 shards live in a BF16/ subdir.
+# The mmproj files are REQUIRED for image/video -- without --mmproj the server
+# is text-only, and every qwen3.8-27b config passes it.
+hf download unsloth/Qwen3.8-27B-GGUF --include "BF16/*" --local-dir /data/models/Qwen3.8-27B
+hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q8_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B
+hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q4_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B
+hf download unsloth/Qwen3.8-27B-GGUF --include "mmproj-BF16.gguf" --local-dir /data/models/Qwen3.8-27B
+hf download unsloth/Qwen3.8-27B-GGUF --include "mmproj-F16.gguf"  --local-dir /data/models/Qwen3.8-27B
+
+# --- run: Strix Halo (108 GiB GTT -- the only box that fits BF16 + full ctx) ---
+# BF16 @ native 262K, ~62 GiB used:
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b
+# BF16 + YaRN x4 @ ~1M, ~88 GiB used (q8_0 KV is mandatory; f16 would need 64 GiB):
+MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m
+
+# --- run: dual R9700 (~62 GiB VRAM, split across both cards) ---
+# Q8 @ native 262K, ~40 GiB used -- the full-context option here:
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8
+# BF16 @ 131K. NOT 262K: that lands at ~62 GiB against a ~62 GiB ceiling with
+# no margin for fragmentation or an uneven layer split.
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b
+
+# --- run: single R9700 (~31 GiB VRAM) ---
+# Q4 @ native 262K, ~28 GiB used. Q8 does NOT belong here: 29.3 GiB of weights
+# alone leaves no room for a KV cache.
+MACHINE=r9700 ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q4
+
+# --- non-thinking (instruct) ---
+# Sampling differs materially from thinking mode (presence-penalty 1.5 vs 0.0).
+# The CLI CANNOT disable thinking -- your client must send, per request:
+#     chat_template_kwargs: {"enable_thinking": false}
+# Without that flag you get thinking output under instruct sampling.
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-instruct
+MACHINE=r9700      ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-instruct-q4
+
+# Also request-side only (not CLI flags): reasoning_effort (xhigh default /
+# medium / low) and preserve_thinking. Lowering reasoning_effort does not
+# reliably cut agentic latency -- shallower analysis just causes retries.
+
+
+########################################################################
 # Global shell profile (set your machine once)
 ########################################################################
 # Add to ~/.bashrc or ~/.zshrc so you never type MACHINE= again:
@@ -118,6 +171,12 @@ MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 # qwen3-coder-next     --temp 1.0 --top-p 0.95 --top-k 40 --min-p .01 80B MoE (UD-Q5_K_M ~55 GiB), rp 1.0
 # qwen3-coder-next-q4  same sampling                                  80B MoE (UD-Q4_K_XL ~46 GiB)
 # qwen3-coder-next-1m  same sampling + YaRN x4 rope scaling           ~1M ctx; YaRN hurts short ctx
+# qwen3.8-27b          --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0   BF16 ~50.9 GiB; thinking mode
+# qwen3.8-27b-q8       same sampling                                  UD-Q8_K_XL ~29.3 GiB
+# qwen3.8-27b-q4       same sampling                                  UD-Q4_K_XL ~16.7 GiB
+# qwen3.8-27b-1m       same sampling + YaRN x4 rope scaling           ~1M ctx; YaRN hurts short ctx
+# qwen3.8-27b-instruct --temp 0.7 --top-p 0.80 --presence-penalty 1.5 non-thinking; Q8 weights
+# qwen3.8-27b-instruct-q4  same instruct sampling                     non-thinking; Q4 weights
 #
 # models/<name>.env carries ONLY the weight path + sampling. GPU-specific fit
 # (CPU-MoE offload, context, KV quant, multi-GPU split) lives per card in
