@@ -97,7 +97,9 @@ scripts/llama-watch.sh 5 http://otherhost:8080
 TIME      STATE   PROMPT     DECODED    CTX%      KV
 16:04:00  BUSY    99268      2018       39.4%     103303/262144
 16:04:02  BUSY    99268      2049       39.4%     103365/262144
-``` See [commands.txt](commands.txt) for the full model list and download commands.
+```
+
+See [commands.txt](commands.txt) for the full model list and download commands.
 
 ### Per-model tuning
 
