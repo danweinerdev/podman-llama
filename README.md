@@ -86,7 +86,7 @@ Both launchers pass `--metrics` by default, so `llama-server` exposes a Promethe
 | `/props` | no | Static config readback — confirm split mode, context, and sampling actually took effect. |
 | `/health` | no | Liveness. |
 
-[`scripts/llama-watch.sh`](scripts/llama-watch.sh) polls `/slots` and prints one line per interval (state, prompt tokens, decoded tokens, context used):
+[`scripts/llama-watch.sh`](scripts/llama-watch.sh) polls `/slots` and redraws a status block **in place** each interval, so the terminal shows current state instead of a scrolling log:
 
 ```sh
 scripts/llama-watch.sh          # 2s against http://127.0.0.1:8080
@@ -94,10 +94,16 @@ scripts/llama-watch.sh 5 http://otherhost:8080
 ```
 
 ```
-TIME      STATE   PROMPT     DECODED    CTX%      KV
-16:04:00  BUSY    99268      2018       39.4%     103303/262144
-16:04:02  BUSY    99268      2049       39.4%     103365/262144
+llama-watch  http://127.0.0.1:8080  every 3s  16:12:07
+  slot 0  BUSY    15.0 tok/s
+  ████████████░░░░░░░░░░░░░░░░  109136/262144 (41.6% of ctx)
+  prompt 108818   processed 108501
+  decoded 318      remaining 31682
 ```
+
+The tok/s figure is derived by differencing `n_decoded` between polls — `/slots` reports counters, not a rate — so it is a one-interval average and will jitter; the rate `llama-server` logs at the end of a request is authoritative.
+
+Note that `/slots` is served from the same thread that runs inference, so a busy server answers it only between batches (measured 3–5.5 s latency, and occasional connection failures, while decoding at 262K). The script allows a generous timeout and shows a `stale xN` marker rather than flashing "unreachable" on one slow poll.
 
 See [commands.txt](commands.txt) for the full model list and download commands.
 
