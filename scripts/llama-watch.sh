@@ -38,7 +38,6 @@ trap 'cleanup; cleanup_state' EXIT INT TERM
 printf '\033[?25l'   # hide cursor while redrawing
 
 FIRST=1
-LINES=0
 
 # /slots is served from the same thread that runs inference, so a busy server
 # answers it only between batches -- measured 3-5.5s latency, and outright
@@ -49,6 +48,18 @@ CURL_TIMEOUT="$(python3 -c "print(max(15, ${INTERVAL}*4))")"
 STALE_LIMIT=3
 stale=0
 last_body=""
+
+# Frame height must be constant for the whole session, otherwise the cursor
+# rewind and the drawn height disagree and stale lines survive the redraw.
+# Probe the slot count once; fall back to 1 slot if the server is not up yet.
+n_slots="$(curl -sf --max-time "$CURL_TIMEOUT" "${BASE}/slots" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(len(d) if isinstance(d,list) else 1)
+except Exception: print(1)' 2>/dev/null || echo 1)"
+[[ "$n_slots" =~ ^[0-9]+$ && "$n_slots" -ge 1 ]] || n_slots=1
+FRAME_LINES=$(( 1 + 4*n_slots + 1 ))
+export FRAME_LINES
 
 while :; do
     if body="$(curl -sf --max-time "$CURL_TIMEOUT" "${BASE}/slots" 2>/dev/null)"; then
@@ -63,13 +74,15 @@ while :; do
         fi
     fi
 
-    # Move back up over the previously drawn block (skip on the first pass).
-    if [[ $FIRST -eq 0 && $LINES -gt 0 ]]; then
-        printf '\033[%dA' "$LINES"
+    # Move back up over the previously drawn block (skip on the first pass),
+    # then clear from the cursor to the end of the screen so a shorter frame
+    # can never leave remnants of a taller one behind.
+    if [[ $FIRST -eq 0 ]]; then
+        printf '\033[%dA\033[0J' "$FRAME_LINES"
     fi
     FIRST=0
 
-    out="$(BASE="$BASE" INTERVAL="$INTERVAL" STALE="$stale" STATE_PATH="$STATE_PATH" python3 -c '
+    out="$(BASE="$BASE" INTERVAL="$INTERVAL" STALE="$stale" STATE_PATH="$STATE_PATH" FRAME_LINES="$FRAME_LINES" python3 -c '
 import json, os, sys, datetime
 
 RESET="\033[0m"; BOLD="\033[1m"; DIM="\033[2m"
@@ -80,24 +93,33 @@ stale=int(os.environ.get("STALE","0"))
 state_path=os.environ["STATE_PATH"]
 
 raw=sys.stdin.read().strip()
+# 1 header + 4 per slot + 1 footer. Sized for the slot count the server
+# actually reports, so PARALLEL>1 still gets a stable frame.
+FRAME_LINES=int(os.environ.get("FRAME_LINES","6"))
 lines=[]
 def emit(s=""): lines.append(s)
 
 now=datetime.datetime.now().strftime("%H:%M:%S")
 
+def finish():
+    # Every frame is padded to the same height so the redraw never has to
+    # rewind a different number of lines than it drew.
+    emit(f"  {DIM}Ctrl-C to exit{RESET}")
+    while len(lines) < FRAME_LINES: emit("")
+    print("\n".join(lines[:FRAME_LINES]))
+    sys.exit(0)
+
 if not raw:
     emit(f"{BOLD}llama-watch{RESET}  {DIM}{base}{RESET}")
     emit(f"  {RED}unreachable{RESET}  {DIM}last check {now}{RESET}")
-    emit("")
-    print("\n".join(lines)); sys.exit(0)
+    finish()
 
 try:
     d=json.loads(raw)
 except Exception:
     emit(f"{BOLD}llama-watch{RESET}  {DIM}{base}{RESET}")
     emit(f"  {RED}bad response{RESET}  {DIM}{now}{RESET}")
-    emit("")
-    print("\n".join(lines)); sys.exit(0)
+    finish()
 
 slots = d if isinstance(d, list) else [d]
 
@@ -158,15 +180,12 @@ try:
 except Exception:
     pass
 
-emit(f"  {DIM}Ctrl-C to exit{RESET}")
-print("\n".join(lines))
+finish()
 ' <<<"$body")"
 
-    # Clear each line as we redraw so shorter output never leaves stale text.
     while IFS= read -r line; do
         printf '\033[2K%s\n' "$line"
     done <<<"$out"
 
-    LINES=$(printf '%s\n' "$out" | wc -l)
     sleep "$INTERVAL"
 done
