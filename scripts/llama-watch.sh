@@ -22,7 +22,7 @@ set -euo pipefail
 # Ctrl-C to exit; the cursor is restored on the way out.
 
 INTERVAL="${1:-2}"
-BASE="${2:-http://127.0.0.1:8080}"
+BASE="${2:-http://127.0.0.1:18080}"
 
 command -v curl >/dev/null || { echo "curl not found" >&2; exit 1; }
 
