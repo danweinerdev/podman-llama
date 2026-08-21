@@ -1,0 +1,74 @@
+# =============================================================================
+# llama.cpp rdna-boosts – dual Radeon AI PRO R9700 – ROCm 7.14 / RCCL
+# =============================================================================
+#
+# This image intentionally uses AMD's supported Ubuntu ROCm 7.14 image instead
+# of Fedora's ROCm 7.1 packages. The latter enumerates both gfx1201 devices but
+# crashes on every model upload with HSA "Reason: Memory in use" on this host.
+#
+# The source revision defaults to the rdna-boosts commit reviewed on 2026-08-21.
+# Override LLAMA_REF when intentionally testing a newer branch revision.
+
+# `7.14.0-full` pinned by digest so the ROCm userspace cannot drift.
+FROM docker.io/rocm/dev-ubuntu-24.04@sha256:439edaa8f0c4be4a3728e528f87b8a2ea1f051f34cf10b27caa4bd94f562eda7 AS builder
+
+ARG LLAMA_REF=7a845b7098cf381253f8fddeaf5d2c8062f65f46
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        cmake \
+        git \
+        libcurl4-openssl-dev \
+        ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN git clone https://github.com/stew675/llama.cpp.git \
+    && cd llama.cpp \
+    && git checkout "${LLAMA_REF}"
+
+WORKDIR /build/llama.cpp
+ENV ROCM_PATH=/opt/rocm
+
+# Match the working R9700 build described in the saved optimization notes:
+# native gfx1201, RCCL tensor parallelism, HIP graphs, and the LLVM unroll fix.
+RUN HIPCXX=/opt/rocm/lib/llvm/bin/clang \
+    HIP_PATH=/opt/rocm \
+    cmake -S . -B build \
+        -G Ninja \
+        -DGGML_RPC=ON \
+        -DGGML_HIP=ON \
+        -DGGML_NATIVE=ON \
+        -DGGML_HIP_RCCL=ON \
+        -DGGML_HIP_GRAPHS=ON \
+        -DHIP_PLATFORM=amd \
+        -DGPU_TARGETS=gfx1201 \
+        -DAMDGPU_TARGETS=gfx1201 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_C_COMPILER=/opt/rocm/lib/llvm/bin/clang \
+        -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+        -DCMAKE_INSTALL_RPATH="\$ORIGIN:/opt/rocm/lib" \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600" \
+        -DLLAMA_CURL=ON \
+    && cmake --build build --config Release -j"$(nproc)"
+
+FROM docker.io/rocm/dev-ubuntu-24.04@sha256:439edaa8f0c4be4a3728e528f87b8a2ea1f051f34cf10b27caa4bd94f562eda7 AS runtime
+
+COPY --from=builder /build/llama.cpp/build/bin/ /usr/local/bin/
+
+ENV ROCM_PATH=/opt/rocm
+ENV LD_LIBRARY_PATH=/usr/local/bin:/opt/rocm/lib:/opt/rocm/lib64:/opt/rocm/lib/llvm/lib
+ENV AMD_LOG_LEVEL=0
+
+# The official ROCm image already provides the unprivileged UID 1000 `ubuntu`
+# account, which matches the rootless host user and avoids duplicate-UID setup.
+USER ubuntu
+WORKDIR /home/ubuntu
+
+VOLUME ["/models"]
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/llama-server"]
+CMD ["--help"]

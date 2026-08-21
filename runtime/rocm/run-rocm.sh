@@ -48,6 +48,7 @@ fallback CTX_SIZE   PODMAN_LLAMA_CTX_SIZE
 fallback UBATCH     PODMAN_LLAMA_UBATCH
 fallback BATCH      PODMAN_LLAMA_BATCH
 fallback THREADS    PODMAN_LLAMA_THREADS
+fallback PARALLEL   PODMAN_LLAMA_PARALLEL
 fallback METRICS    PODMAN_LLAMA_METRICS
 
 # --- inject per-model config -------------------------------------------------
@@ -98,6 +99,7 @@ IMAGE="${IMAGE:-llama-strix-halo:rocm}"
 FLASH_ATTN="${FLASH_ATTN:-on}"
 CACHE_TYPE_K="${CACHE_TYPE_K:-q8_0}"
 CACHE_TYPE_V="${CACHE_TYPE_V:-q8_0}"
+PARALLEL="${PARALLEL:-1}"
 
 # Assemble the ROCm env args conditionally from the profile.
 env_args=()
@@ -117,6 +119,16 @@ mmap_args=()
 metrics_args=()
 [[ "${METRICS:-1}" == "1" ]] && metrics_args+=(--metrics)
 
+# Fedora SELinux container labeling can block ROCm HSA host-memory mappings.
+# Opt out only from profiles that explicitly request it; retain the other
+# hardening flags. A label-disabled mount must not request SELinux relabeling.
+security_args=(--security-opt no-new-privileges --cap-drop=ALL)
+models_mount="${MODELS_DIR}:/models:ro,z"
+if [[ "${MACHINE}" == "r9700-dual-rocm" && "${DISABLE_SELINUX_LABEL:-0}" == "1" ]]; then
+    security_args+=(--security-opt label=disable)
+    models_mount="${MODELS_DIR}:/models:ro"
+fi
+
 # Hold a systemd sleep inhibitor for the lifetime of the container so the host
 # doesn't suspend mid-inference. The lock is released automatically when
 # podman run exits (normally or via Ctrl-C).
@@ -129,10 +141,9 @@ systemd-inhibit \
     --device /dev/kfd \
     --device /dev/dri \
     --group-add keep-groups \
-    --security-opt no-new-privileges \
-    --cap-drop=ALL \
+    "${security_args[@]}" \
     "${env_args[@]}" \
-    -v "${MODELS_DIR}:/models:ro,z" \
+    -v "${models_mount}" \
     -p "${PORT}:8080" \
     --ulimit memlock=-1:-1 \
     "${IMAGE}" \
@@ -140,6 +151,7 @@ systemd-inhibit \
     -ngl 999 \
     -fit off \
     --ctx-size "${CTX_SIZE}" \
+    --parallel "${PARALLEL}" \
     --flash-attn "${FLASH_ATTN}" \
     --cache-type-k "${CACHE_TYPE_K}" \
     --cache-type-v "${CACHE_TYPE_V}" \
