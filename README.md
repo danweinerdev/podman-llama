@@ -12,8 +12,9 @@ Two backends are provided:
 | File | Purpose |
 | --- | --- |
 | [Containerfile.rocm](Containerfile.rocm) | Multi-stage Fedora 44 build of llama.cpp w/ ROCm/HIP + UMA, tuned for `gfx1151` |
+| [Containerfile.r9700-rocm](Containerfile.r9700-rocm) | ROCm 7.14 + `rdna-boosts` + RCCL image for the experimental dual-R9700 tensor path |
 | [Containerfile.vulkan](Containerfile.vulkan) | Multi-stage Fedora 44 build of llama.cpp w/ Vulkan via Mesa RADV |
-| [Makefile](Makefile) | `make build-rocm` / `make build-vulkan` / `make all` |
+| [Makefile](Makefile) | `make build-rocm` / `make build-rocm-r9700` / `make build-vulkan` / `make all` |
 | [runtime/rocm/run-rocm.sh](runtime/rocm/run-rocm.sh) | Generic `llama-server` launcher (ROCm) — no per-model logic |
 | [runtime/vulkan/run-vulkan.sh](runtime/vulkan/run-vulkan.sh) | Generic `llama-server` launcher (Vulkan) — no per-model logic |
 | [profiles/](profiles/) | Per-GPU env config: `profiles/<MACHINE>/default.env` (card defaults) + optional `profiles/<MACHINE>/<model>.env` (GPU-specific fit tuning) |
@@ -24,6 +25,7 @@ Two backends are provided:
 
 ```sh
 make build-rocm     # → llama-strix-halo:rocm
+make build-rocm-r9700 # → llama-r9700:rocm (gfx1201 + experimental RCCL)
 make build-vulkan   # → llama-strix-halo:vulkan
 make                # both
 ```
@@ -42,6 +44,7 @@ Machines are supported via env **profiles** in [profiles/](profiles/):
 | --- | --- | --- | --- |
 | `r9700` | 1× Radeon AI PRO R9700 (gfx1201, RDNA4, 32 GiB VRAM) | ROCm | native gfx1201, discrete-GPU pinning, ctx 32k |
 | `r9700-dual` | 2× Radeon AI PRO R9700 (~62 GiB VRAM total) | Vulkan | multi-GPU `--tensor-split`, all-VRAM (no CPU-MoE), e.g. Qwen-Next UD-Q4_K_XL @ 256k |
+| `r9700-dual-rocm` | 2× Radeon AI PRO R9700 (~62 GiB VRAM total) | ROCm/RCCL (experimental) | separate gfx1201 tensor-parallel A/B path; weights and KV split across both cards |
 | `strixhalo` | Ryzen AI Max+ 395 (gfx1151, unified mem) | Vulkan | `HSA_OVERRIDE=11.5.1` + UMA (ROCm), ctx 128k |
 
 The run scripts are **generic**: they contain no per-model logic. Both `runtime/rocm/run-rocm.sh` and `runtime/vulkan/run-vulkan.sh` take a model **config name** (or a raw `.gguf` path), inject up to three env files, mount the models dir read-only, and expose `llama-server` on `http://localhost:8080`:
@@ -66,6 +69,7 @@ Or select the machine per-invocation (overrides the global), and run any model o
 ```sh
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next-q4   # Qwen-Next UD-Q4_K_XL across both R9700s @ 256k
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q6-latest # experimental ROCm/RCCL tensor A/B
 MACHINE=r9700      ./runtime/rocm/run-rocm.sh SomeModel/model.gguf --ctx-size 8192   # raw path
 ```
 
@@ -132,31 +136,86 @@ Hybrid-attention VL model, arch `qwen35`, native context 262,144. Only 16 of its
 | Config | Weights | `r9700` | `r9700-dual` | `strixhalo` |
 | --- | --- | --- | --- | --- |
 | `qwen3.8-27b` | BF16, 50.9 GiB | — | 131,072 — the practical BF16 ceiling here | **262,144** — flagship placement |
-| `qwen3.8-27b-q8` | UD-Q8_K_XL, 29.3 GiB | — (no room for KV) | **262,144**, ~22 GiB slack | — (use BF16) |
+| `qwen3.8-27b-q8` | existing UD-Q8_K_XL | — (no room for KV) | **262,144**, ~22 GiB slack | — (use BF16) |
+| `qwen3.8-27b-q8-latest` | latest UD-Q8_K_XL, 29.30 GiB / 31.5 GB | — (no room for KV) | **262,144**, ~22.7 GiB arithmetic slack; `layer` compatibility baseline | — (use BF16) |
+| `qwen3.8-27b-q6-latest` | latest UD-Q6_K_XL, 23.56 GiB / 25.3 GB | — (no room for KV) | **262,144**, ~28.4 GiB arithmetic slack; separate `layer`-mode baseline | — (use BF16) |
 | `qwen3.8-27b-q4` | UD-Q4_K_XL, 16.7 GiB | **262,144** on one card | — | — |
 | `qwen3.8-27b-1m` | BF16 + YaRN ×4 | — | — | **1,048,576** (~88 GiB) |
 | `qwen3.8-27b-instruct` | UD-Q8_K_XL | — | 262,144 | 262,144 |
 | `qwen3.8-27b-instruct-q4` | UD-Q4_K_XL | 262,144 | — | — |
 
-Why the gaps: BF16 at 262,144 on the pair needs ~62 GiB against a ~62 GiB ceiling — no margin for fragmentation or an uneven layer split, hence 131,072 there. Q8 is 29.3 GiB of weights alone, so on a single 31 GiB card nothing is left for KV; Q4 is what makes one card work. Only Strix Halo's 108 GiB holds BF16 weights *and* a 34 GiB 1M cache.
+Why the gaps: BF16 at 262,144 on the pair needs ~62 GiB against a ~62 GiB ceiling — no margin for fragmentation or an uneven layer split, hence 131,072 there. UD-Q8_K_XL is 29.30 GiB of weights alone, so on a single 31 GiB card nothing is left for KV; the latest build is kept as a separate dual-card A/B target. Q4 is what makes one card work. Only Strix Halo's 108 GiB holds BF16 weights *and* a 34 GiB 1M cache.
 
 Download commands are in [commands.txt](commands.txt); the budgets above are arithmetic, not measured.
 
-**Split mode on `r9700-dual`:** these profiles override the card default to `--split-mode row`. Layer mode assigns whole layers per card, so a *dense* model leaves one card idle while the other computes; row mode splits each tensor so both work at once. Measured on the Q8 config — prefill 74.23 → 98.56 t/s (**+32.8%**), decode 15.75 → 17.24 t/s (**+9.5%**) — and it relieves a VRAM imbalance that left GPU[0] at 97% allocated vs GPU[1] at 68%. Decode gains little because single-stream decode is bandwidth-bound: ~29.3 GiB of Q8 weights per token against ~640 GB/s caps a single card near 21 t/s, so 17.24 is ~82% of the practical ceiling. The Coder-Next profiles deliberately stay on `layer` (80B MoE, ~3B active — different traffic pattern, untested). Override inline with `SPLIT_MODE=layer`.
+**Split mode on `r9700-dual`:** the existing Q8 profile overrides the card default to `--split-mode row`. Layer mode assigns whole layers per card, so a *dense* model leaves one card idle while the other computes; row mode splits each tensor so both work at once. This was measured on the existing **UD-Q8_K_XL** build — prefill 74.23 → 98.56 t/s (**+32.8%**), decode 15.75 → 17.24 t/s (**+9.5%**) — and it relieves a VRAM imbalance that left GPU[0] at 97% allocated vs GPU[1] at 68%. The latest Q8 target defaults to `layer`: the current Vulkan container rejects row mode for that GGUF with `device Vulkan0 does not support split buffers`. The latest Q6 target is a separate, unmeasured `layer`-mode baseline with `TENSOR_SPLIT=0.6,1.4`; verify it before retuning. Decode gains little because single-stream decode is bandwidth-bound: ~29.30 GiB of weights per token against ~640 GB/s caps a single card near 21 t/s, so 17.24 is ~82% of the practical ceiling. Re-test row only after the Vulkan backend reports split-buffer support.
 
 ```bash
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b        # BF16 @ 262K
 MACHINE=strixhalo  ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m     # YaRN x4 @ 1M
-MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8     # Q8 across both cards @ 262K
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8     # UD-Q8_K_XL @ 262K
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8-latest # latest UD-Q8_K_XL, layer-mode baseline
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q6-latest # latest UD-Q6_K_XL, separate layer-mode baseline
 MACHINE=r9700      ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q4     # Q4 on one card @ 262K
 ```
+
+### Experimental dual-R9700 ROCm/RCCL A/B
+
+`r9700-dual-rocm` is a separate, opt-in ROCm image and profile; it does not alter
+the working `r9700-dual` Vulkan profiles. Build it with `make build-rocm-r9700`,
+then run the text-only latest quants at their native 262K context:
+
+```sh
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q6-latest
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q8-latest
+# The dual profiles expose their container on host port 18080:
+scripts/llama-watch.sh 2 http://127.0.0.1:18080
+```
+
+The profile uses experimental `--split-mode tensor` with balanced `1,1`: tensor
+mode distributes weights and KV, unlike the Vulkan layer baseline. It requires
+the ROCm/KFD/RCCL path; if that path fails, use the existing Vulkan profile or a
+layer split on a working backend. Its `--poll 0` setting is for CPU efficiency,
+not a claimed decode gain.
+
+The R9700 image deliberately uses AMD's Ubuntu ROCm 7.14 base and the pinned
+`rdna-boosts` revision from the working reference. Fedora 44's ROCm 7.1.1 stack
+enumerated both local R9700s but crashed during every HIP model upload with
+`Memory critical error ... Reason: Memory in use`, including one-GPU, 8K-context,
+no-mmap, graphs-disabled, and smaller-model controls. That failure occurs before
+KV allocation and is not fixed by reducing context, batch size, or split mode.
+The same failure persisted with ROCm 7.14 until the R9700 profile disabled
+SELinux container labeling. This is narrower than `--privileged`: the launcher
+retains `no-new-privileges` and `cap-drop=ALL`, and applies `label=disable` only
+when `profiles/r9700-dual-rocm/default.env` requests it.
+
+Motivation is deliberately not a performance promise: the user-observed local
+Vulkan layer baselines on the latest files are about 19 t/s (Q6) and 17.5 t/s
+(Q8). Saved R9700 notes, using different quant/topology conditions, recorded
+about 18.05 t/s for dual Vulkan Q8_0 versus 29.01 t/s stock and 31.24 t/s
+tweaked dual ROCm tensor parallel at depth 0. Those archived figures are only a
+reason to test; they are not local ROCm results for these Q6/Q8 profiles.
+
+Start with the raw baseline above. MTP is opt-in only, changes throughput
+semantics, is workload-dependent (often larger on code), and must pass
+correctness and quality tests before comparison. It is intentionally not a
+profile default:
+
+```sh
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q8-latest --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.6 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0
+```
+
+Recommended A/B order: hold prompt, context, and output constant and compare
+the Vulkan baseline with ROCm tensor mode; then sweep batch/ubatch if desired;
+only then test MTP. `BATCH`/`UBATCH` mostly affect prefill, not single-token
+decode.
 
 Two things the CLI cannot control, because they live in the chat template:
 
 - **Thinking is on by default** and emits `<think>…</think>` before the answer. Disabling it requires `chat_template_kwargs: {"enable_thinking": false}` **per request** — the `-instruct` configs only change sampling, so pairing them with a client that doesn't send that flag gives you thinking output under instruct sampling, which is the worst of both.
 - **`reasoning_effort`** (`xhigh` default / `medium` / `low`) and **`preserve_thinking`** are likewise request-side. Lowering `reasoning_effort` does not reliably cut agentic latency; shallower analysis just causes retries.
 
-Vision (image + video) is native but needs the multimodal projector, so every config passes `--mmproj` — BF16 weights pair with `mmproj-BF16.gguf`, quantized weights with `mmproj-F16.gguf`. Without it the server is text-only.
+Vision (image + video) is native but needs the multimodal projector. BF16 configs pair with `mmproj-BF16.gguf`, ordinary quantized configs with `mmproj-F16.gguf`; the latest Q8 and Q6 targets are intentionally text-only. Without it the server is text-only.
 
 > Unlike the other models here, these quants sit at the model directory root rather than in per-quant subfolders; only the BF16 shards live in `BF16/`.
 

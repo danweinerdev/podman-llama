@@ -1,8 +1,10 @@
 ########################################################################
 # podman-llama — model download + launch cheatsheet
 #
-# Two target machines:
+# Target machines/backends:
 #   r9700      AMD Radeon AI PRO R9700   (gfx1201, RDNA4, ~31 GiB dedicated VRAM) -> ROCm
+#   r9700-dual       2x R9700 -> Vulkan compatibility baseline
+#   r9700-dual-rocm  2x R9700 -> experimental ROCm/RCCL tensor-parallel A/B path
 #   strixhalo  Ryzen AI Max+ 395         (gfx1151, Radeon 8060S, unified memory)  -> Vulkan
 #
 # Downloads go to /data/models/<Model>/ (the default MODELS_DIR).
@@ -100,9 +102,13 @@ MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3-coder-next
 # NOTE: unlike the other models here, these quants sit at the model dir ROOT
 # (that is how they were pulled); only the BF16 shards live in a BF16/ subdir.
 # The mmproj files are REQUIRED for image/video -- without --mmproj the server
-# is text-only, and every qwen3.8-27b config passes it.
+# is text-only. The latest Q8 and Q6 test targets intentionally omit it.
 hf download unsloth/Qwen3.8-27B-GGUF --include "BF16/*" --local-dir /data/models/Qwen3.8-27B
 hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q8_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B
+# Keep the newly downloaded UD-Q8_K_XL in a separate directory for A/B tests:
+hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q8_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B-GGUF
+# Latest UD-Q6_K_XL (25,299,061,664 bytes, ~23.56 GiB / 25.3 GB), text-only:
+hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q6_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B-GGUF
 hf download unsloth/Qwen3.8-27B-GGUF --include "Qwen3.8-27B-UD-Q4_K_XL.gguf" --local-dir /data/models/Qwen3.8-27B
 hf download unsloth/Qwen3.8-27B-GGUF --include "mmproj-BF16.gguf" --local-dir /data/models/Qwen3.8-27B
 hf download unsloth/Qwen3.8-27B-GGUF --include "mmproj-F16.gguf"  --local-dir /data/models/Qwen3.8-27B
@@ -114,17 +120,43 @@ MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b
 MACHINE=strixhalo ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-1m
 
 # --- run: dual R9700 (~62 GiB VRAM, split across both cards) ---
-# These profiles default to --split-mode row (the card default is layer).
-# Dense models idle one card under layer mode; measured on Q8, row is +32.8%
-# prefill / +9.5% decode and evens out VRAM. A/B it back with SPLIT_MODE=layer.
-# Q8 @ native 262K, ~40 GiB used -- the full-context option here:
+# The existing Q8 profile uses row mode: measured +32.8% prefill / +9.5% decode.
+# The latest test target uses layer mode because the current Vulkan backend rejects
+# row mode for that GGUF with "device Vulkan0 does not support split buffers".
+# Thinking is default. Prescribed thinking sampling: temp 1.0, top-p 0.95,
+# top-k 20, min-p 0.0, presence-penalty 0.0, repeat-penalty 1.0.
+# UD-Q8_K_XL (31,457,991,680 bytes, ~29.30 GiB / 31.5 GB) @ native 262K:
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8
+# Latest UD-Q8_K_XL in Qwen3.8-27B-GGUF, kept separate for A/B testing.
+# It keeps the 0.6,1.4 weight bias but uses a compatible layer-mode baseline:
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q8-latest
+# Latest UD-Q6_K_XL is text-only. This separate layer-mode baseline uses the
+# unmeasured 0.6,1.4 display-card bias; verify it before retuning:
+MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q6-latest
 # BF16 @ 131K. NOT 262K: that lands at ~62 GiB against a ~62 GiB ceiling with
 # no margin for fragmentation or an uneven layer split.
 MACHINE=r9700-dual ./runtime/vulkan/run-vulkan.sh qwen3.8-27b
 
+# --- experimental ROCm/RCCL tensor-parallel A/B (separate from r9700-dual Vulkan) ---
+# Build the opt-in ROCm 7.14 + rdna-boosts gfx1201 image first. This is separate
+# from the Fedora ROCm 7.1 Strix image, which failed local R9700 model uploads:
+make build-rocm-r9700                         # -> llama-r9700:rocm
+# Tensor mode distributes weights and KV across both cards. It is experimental:
+# if ROCm/KFD/RCCL fails, fall back to the existing Vulkan profile or layer mode
+# on a working backend. These latest Q6/Q8 targets are text-only and raw baselines
+# (no MTP profile default):
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q6-latest
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q8-latest
+# Optional MTP changes throughput semantics, is workload-dependent (often larger
+# on code), and must pass correctness/quality tests before comparing it:
+MACHINE=r9700-dual-rocm ./runtime/rocm/run-rocm.sh qwen3.8-27b-q8-latest --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.6 --spec-draft-type-k q8_0 --spec-draft-type-v q8_0
+# A/B order: same prompt/context/output, Vulkan baseline vs ROCm tensor; then
+# batch/ubatch sweep if desired; only then MTP. B/UB mostly affect prefill, not
+# single-token decode. Local Vulkan layer baselines (~19 t/s Q6, ~17.5 t/s Q8)
+# motivate the test only; they are not local ROCm results.
+
 # --- run: single R9700 (~31 GiB VRAM) ---
-# Q4 @ native 262K, ~28 GiB used. Q8 does NOT belong here: 29.3 GiB of weights
+# Q4 @ native 262K, ~28 GiB used. UD-Q8_K_XL does NOT belong here: 29.30 GiB of weights
 # alone leaves no room for a KV cache.
 MACHINE=r9700 ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-q4
 
@@ -175,7 +207,9 @@ MACHINE=r9700      ./runtime/vulkan/run-vulkan.sh qwen3.8-27b-instruct-q4
 # qwen3-coder-next-q4  same sampling                                  80B MoE (UD-Q4_K_XL ~46 GiB)
 # qwen3-coder-next-1m  same sampling + YaRN x4 rope scaling           ~1M ctx; YaRN hurts short ctx
 # qwen3.8-27b          --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0   BF16 ~50.9 GiB; thinking mode
-# qwen3.8-27b-q8       same sampling                                  UD-Q8_K_XL ~29.3 GiB
+# qwen3.8-27b-q8       same sampling                                  UD-Q8_K_XL ~29.30 GiB / 31.5 GB
+# qwen3.8-27b-q8-latest same sampling                                 latest UD-Q8_K_XL, separate path/alias
+# qwen3.8-27b-q6-latest same sampling                                 latest UD-Q6_K_XL, text-only layer baseline
 # qwen3.8-27b-q4       same sampling                                  UD-Q4_K_XL ~16.7 GiB
 # qwen3.8-27b-1m       same sampling + YaRN x4 rope scaling           ~1M ctx; YaRN hurts short ctx
 # qwen3.8-27b-instruct --temp 0.7 --top-p 0.80 --presence-penalty 1.5 non-thinking; Q8 weights
